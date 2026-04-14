@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🎬 Dark Viral Video Generator</title>
+  <style>
+    :root {
+      --bg:       #08080f;
+      --bg2:      #10101e;
+      --bg3:      #181828;
+      --purple:   #7c3aed;
+      --purple2:  #9f5fff;
+      --gold:     #f59e0b;
+      --red:      #ef4444;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --border:   #1e1e35;
+      --success:  #22c55e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: linear-gradient(135deg, #0d0d1f 0%, #1a0a2e 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 20px 24px;
+      text-align: center;
+    }
+    header h1 { font-size: 1.6rem; font-weight: 800; color: #fff; }
+    header h1 span { color: var(--purple2); }
+    header p  { color: var(--muted); font-size: .85rem; margin-top: 4px; }
+
+    /* ── Layout ── */
+    main {
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 24px 16px 60px;
+    }
+
+    /* ── Card ── */
+    .card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 16px;
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--purple2);
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* ── Form elements ── */
+    label {
+      display: block;
+      font-size: .8rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    input[type="text"], input[type="password"], select, textarea {
+      width: 100%;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: var(--text);
+      font-size: .95rem;
+      transition: border-color .2s;
+      margin-bottom: 18px;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--purple);
+    }
+    select { cursor: pointer; }
+    textarea { resize: vertical; min-height: 80px; }
+
+    /* ── Pills (style selector) ── */
+    .pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+    .pill {
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: 1.5px solid var(--border);
+      background: var(--bg3);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: .85rem;
+      font-weight: 600;
+      transition: all .2s;
+      user-select: none;
+    }
+    .pill:hover  { border-color: var(--purple); color: var(--text); }
+    .pill.active { border-color: var(--purple); background: rgba(124,58,237,.2); color: var(--purple2); }
+
+    /* ── Duration slider ── */
+    .slider-wrap { margin-bottom: 18px; }
+    .slider-labels { display: flex; justify-content: space-between; color: var(--muted); font-size: .8rem; margin-top: 4px; }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--purple);
+      background: transparent;
+      height: 6px;
+      cursor: pointer;
+    }
+    #durationVal { color: var(--purple2); font-weight: 700; }
+
+    /* ── Button ── */
+    .btn-generate {
+      width: 100%;
+      padding: 16px;
+      background: linear-gradient(135deg, var(--purple), #5b21b6);
+      border: none;
+      border-radius: 12px;
+      color: #fff;
+      font-size: 1.1rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: opacity .2s, transform .1s;
+      letter-spacing: .04em;
+    }
+    .btn-generate:hover:not(:disabled) { opacity: .9; transform: translateY(-1px); }
+    .btn-generate:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* ── Progress ── */
+    #progressCard { display: none; }
+    .progress-bar-wrap {
+      background: var(--bg3);
+      border-radius: 999px;
+      height: 10px;
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, var(--purple), var(--purple2));
+      border-radius: 999px;
+      transition: width .4s ease;
+      width: 0%;
+    }
+    .progress-pct {
+      text-align: center;
+      font-size: 1.4rem;
+      font-weight: 800;
+      color: var(--purple2);
+      margin-bottom: 8px;
+    }
+    .log-box {
+      background: #000;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: .8rem;
+      font-family: 'Courier New', monospace;
+      color: #6ee7b7;
+      max-height: 160px;
+      overflow-y: auto;
+      line-height: 1.7;
+    }
+    .log-box .err { color: var(--red); }
+    .log-box .warn { color: var(--gold); }
+
+    /* ── Result ── */
+    #resultCard { display: none; }
+    .video-wrap {
+      border-radius: 12px;
+      overflow: hidden;
+      background: #000;
+      margin-bottom: 16px;
+      aspect-ratio: 9/16;
+      max-height: 420px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .video-wrap video { width: 100%; height: 100%; object-fit: contain; }
+    .btn-download {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 14px;
+      background: var(--success);
+      border: none;
+      border-radius: 12px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      margin-bottom: 10px;
+    }
+    .btn-new {
+      display: block;
+      text-align: center;
+      color: var(--muted);
+      font-size: .85rem;
+      cursor: pointer;
+      padding: 8px;
+      text-decoration: underline;
+    }
+    .btn-new:hover { color: var(--text); }
+
+    /* ── Error ── */
+    #errorCard { display: none; }
+    .error-msg {
+      background: rgba(239,68,68,.1);
+      border: 1px solid rgba(239,68,68,.3);
+      border-radius: 10px;
+      padding: 14px;
+      color: var(--red);
+      font-size: .9rem;
+    }
+
+    /* ── Topic chips ── */
+    .topics-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+    .topic-chip {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: .78rem;
+      color: var(--muted);
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .topic-chip:hover { border-color: var(--purple); color: var(--text); }
+
+    /* ── Config toggle ── */
+    .config-toggle {
+      color: var(--muted);
+      font-size: .8rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+    .config-toggle:hover { color: var(--text); }
+    #configPanel { display: none; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: var(--bg2); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🎬 Dark <span>Viral</span> Video</h1>
+  <p>Gera vídeos virais estilo TikTok automaticamente • 100% grátis</p>
+</header>
+
+<main>
+
+  <!-- ── Formulário ── -->
+  <div id="formCard" class="card">
+    <h2>✏️ Configure seu vídeo</h2>
+
+    <label>Tema do vídeo</label>
+    <input id="topicInput" type="text" placeholder="Ex: segredos da mente humana..." />
+
+    <div class="topics-wrap" id="topicsWrap"></div>
+
+    <label>Estilo</label>
+    <div class="pills">
+      <div class="pill active" data-val="dark">🌑 Dark</div>
+      <div class="pill" data-val="emotional">💜 Emocional</div>
+      <div class="pill" data-val="informative">🔎 Informativo</div>
+    </div>
+
+    <label>Voz</label>
+    <select id="voiceSelect">
+      <option value="dark-male">🎙️ Masculina dark (grave)</option>
+      <option value="dark-female">🎙️ Feminina dark (sussurro)</option>
+      <option value="narrator">🎙️ Narrador dramático</option>
+    </select>
+
+    <label>Visual</label>
+    <select id="visualSelect">
+      <option value="cinematic">🎥 Cinemático</option>
+      <option value="moody">🌫️ Sombrio</option>
+      <option value="horror">😱 Horror</option>
+      <option value="subtle">✨ Sutil</option>
+    </select>
+
+    <div class="slider-wrap">
+      <label>Duração: <span id="durationVal">30s</span></label>
+      <input type="range" id="durationSlider" min="15" max="60" step="5" value="30">
+      <div class="slider-labels"><span>15s</span><span>60s</span></div>
+    </div>
+
+    <!-- Configurações opcionais -->
+    <div class="config-toggle" onclick="toggleConfig()">
+      ⚙️ Configurações opcionais (API keys gratuitas)
+      <span id="configArrow">▼</span>
+    </div>
+    <div id="configPanel">
+      <label>Groq API Key <span style="color:var(--success);font-size:.75rem">(grátis em console.groq.com)</span></label>
+      <input id="groqKey" type="password" placeholder="gsk_..." autocomplete="off">
+      <label>Pexels API Key <span style="color:var(--success);font-size:.75rem">(grátis em pexels.com/api)</span></label>
+      <input id="pexelsKey" type="password" placeholder="Opcional — melhora as imagens" autocomplete="off">
+    </div>
+
+    <button class="btn-generate" id="btnGenerate" onclick="generate()">
+      ⚡ Gerar Vídeo Grátis
+    </button>
+  </div>
+
+  <!-- ── Progresso ── -->
+  <div id="progressCard" class="card">
+    <h2>⏳ Gerando seu vídeo...</h2>
+    <div class="progress-pct" id="progressPct">0%</div>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="log-box" id="logBox"></div>
+  </div>
+
+  <!-- ── Resultado ── -->
+  <div id="resultCard" class="card">
+    <h2>🎉 Vídeo pronto!</h2>
+    <div class="video-wrap">
+      <video id="videoPlayer" controls playsinline></video>
+    </div>
+    <a id="btnDownload" class="btn-download" download>
+      ⬇️ Baixar Vídeo (.mp4)
+    </a>
+    <span class="btn-new" onclick="newVideo()">+ Gerar outro vídeo</span>
+  </div>
+
+  <!-- ── Erro ── -->
+  <div id="errorCard" class="card">
+    <h2>❌ Algo deu errado</h2>
+    <div class="error-msg" id="errorMsg"></div>
+    <br>
+    <span class="btn-new" onclick="newVideo()">← Tentar novamente</span>
+  </div>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
