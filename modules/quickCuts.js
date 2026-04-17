@@ -540,62 +540,77 @@ class QuickCuts {
    * @param {number}   duration
    * @param {Function} drawFn  - (ctx, width, height, frame) => void
    */
-  async _generateCanvasClip(outputPath, duration, drawFn) {
-    const framesDir = path.join(
-      this.tempDir,
-      `qc_frames_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`
-    );
-    ensureDir(framesDir);
-
-    const totalFrames  = Math.max(1, Math.ceil(duration * this.fps));
-    // Sample at most 16 unique frames to keep RAM usage low
-    const sampleFrames = Math.min(totalFrames, 16);
-
-    // Render sample frames
-    for (let f = 0; f < sampleFrames; f++) {
-      const canvas = createCanvas(this.width, this.height);
-      const ctx    = canvas.getContext('2d');
-      // Spread sample frames over the full animation range
-      const animFrame = Math.floor((f / sampleFrames) * totalFrames);
-      drawFn(ctx, this.width, this.height, animFrame);
-
-      const buf  = canvas.toBuffer('image/jpeg', { quality: 0.88 });
-      const name = `frame_${String(f).padStart(5, '0')}.jpg`;
-      fs.writeFileSync(path.join(framesDir, name), buf);
-    }
-
-    // Duplicate frames to reach totalFrames
-    for (let f = sampleFrames; f < totalFrames; f++) {
-      const src = `frame_${String(f % sampleFrames).padStart(5, '0')}.jpg`;
-      const dst = `frame_${String(f).padStart(5, '0')}.jpg`;
-      fs.copyFileSync(
-        path.join(framesDir, src),
-        path.join(framesDir, dst)
+  async _generateCanvasClip(outputPath, duration, drawFn, bgColorHex = '#0d0021') {
+    // First try canvas rendering (needs libcairo on the system)
+    try {
+      const framesDir = path.join(
+        this.tempDir,
+        `qc_frames_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`
       );
-    }
+      ensureDir(framesDir);
 
-    // Encode to video
+      const totalFrames  = Math.max(1, Math.ceil(duration * this.fps));
+      const sampleFrames = Math.min(totalFrames, 16);
+
+      for (let f = 0; f < sampleFrames; f++) {
+        const canvas = createCanvas(this.width, this.height);
+        const ctx    = canvas.getContext('2d');
+        const animFrame = Math.floor((f / sampleFrames) * totalFrames);
+        drawFn(ctx, this.width, this.height, animFrame);
+        const buf  = canvas.toBuffer('image/jpeg', { quality: 0.88 });
+        fs.writeFileSync(path.join(framesDir, `frame_${String(f).padStart(5, '0')}.jpg`), buf);
+      }
+
+      for (let f = sampleFrames; f < totalFrames; f++) {
+        const src = path.join(framesDir, `frame_${String(f % sampleFrames).padStart(5, '0')}.jpg`);
+        const dst = path.join(framesDir, `frame_${String(f).padStart(5, '0')}.jpg`);
+        fs.copyFileSync(src, dst);
+      }
+
+      const cmd = [
+        `"${this.ffmpegPath}"`,
+        '-threads', this.ffmpegThreads,
+        '-framerate', String(this.fps),
+        '-i', `"${path.join(framesDir, 'frame_%05d.jpg')}"`,
+        '-t', String(duration),
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p', '-an',
+        `"${outputPath}"`, '-y',
+      ].join(' ');
+
+      run(cmd, 90000);
+      try { fs.rmSync(framesDir, { recursive: true, force: true }); } catch (_) {}
+
+    } catch (canvasErr) {
+      // Canvas not available (missing libcairo) — fallback to pure FFmpeg lavfi
+      console.warn(`  Canvas unavailable, using FFmpeg fallback: ${canvasErr.message.slice(0, 80)}`);
+      await this._generateFFmpegClip(outputPath, duration, bgColorHex);
+    }
+  }
+
+  /**
+   * Pure FFmpeg background clip — no canvas needed.
+   * Uses lavfi color source + geq filter for animated gradient effect.
+   */
+  async _generateFFmpegClip(outputPath, duration, bgColorHex = '#0d0021') {
+    const { r, g, b } = hexToRgb(bgColorHex);
+    // Use geq to create a subtle animated gradient without canvas
+    const vf = [
+      `geq=r='${r}+10*sin(2*PI*T/3)':g='${g}+5*sin(2*PI*T/4)':b='${b}+15*sin(2*PI*T/2)'`,
+      `scale=${this.width}:${this.height}`,
+    ].join(',');
+
     const cmd = [
       `"${this.ffmpegPath}"`,
       '-threads', this.ffmpegThreads,
-      '-framerate', String(this.fps),
-      '-i', `"${path.join(framesDir, 'frame_%05d.jpg')}"`,
+      '-f', 'lavfi',
+      '-i', `color=c=black:s=${this.width}x${this.height}:r=${this.fps}`,
       '-t', String(duration),
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-crf', '28',
-      '-pix_fmt', 'yuv420p',
-      '-an',
-      `"${outputPath}"`,
-      '-y',
+      '-vf', `"${vf}"`,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p', '-an',
+      `"${outputPath}"`, '-y',
     ].join(' ');
 
-    try {
-      run(cmd, 90000);
-    } finally {
-      // Always clean up frame directory
-      try { fs.rmSync(framesDir, { recursive: true, force: true }); } catch (_) {}
-    }
+    run(cmd, 60000);
   }
 
   /**
