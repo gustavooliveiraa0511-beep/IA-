@@ -1,389 +1,282 @@
 /**
  * Video Composer Module
- * Assembles images, videos, audio, and subtitles into final vertical video
- * Applies dark filters, Ken Burns effects, transitions, and sound effects
+ * Assembles script segments into a final vertical viral video.
+ *
+ * Pipeline:
+ *   1. QuickCuts breaks each segment into 1.5–2 s micro-clips.
+ *   2. Every 3rd clip gets a flash frame inserted (QuickCuts.addFlashFrame).
+ *   3. All clips are concatenated via FFmpeg concat demuxer.
+ *   4. A light dark filter (curves + vignette) is applied.
+ *   5. ASS subtitles are burned in via subtitleRenderer.js.
+ *   6. Whoosh sound effects (FxEngine) are placed at each cut timestamp.
+ *   7. Final audio mix: narration + music + SFX.
+ *
+ * Memory budget: Railway free tier ~512 MB.
+ * All FFmpeg calls use -threads 2 / ultrafast / crf 28 / 720x1280.
  */
 
-const { createCanvas, loadImage } = require('canvas');
-const { execSync, exec, spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
+'use strict';
+
+const { createCanvas }   = require('canvas');
+const { execSync }       = require('child_process');
+const fs                 = require('fs');
+const path               = require('path');
+const { QuickCuts }      = require('./quickCuts');
+const FxEngine           = require('./fxEngine');
 
 class VideoComposer {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.width]
+   * @param {number} [options.height]
+   * @param {number} [options.fps]
+   * @param {string} [options.outputDir]
+   * @param {string} [options.tempDir]
+   */
   constructor(options = {}) {
-    // Railway free tier tem ~512MB RAM — usa resolução menor para não explodir
     const isLowMem = process.env.RAILWAY_ENVIRONMENT || process.env.LOW_MEMORY;
-    this.width  = options.width  || (isLowMem ? 720  : 1080);
-    this.height = options.height || (isLowMem ? 1280 : 1920);
-    this.fps    = options.fps    || (isLowMem ? 24   : 30);
-    // Limita threads do FFmpeg para não estourar RAM
-    this.ffmpegThreads = isLowMem ? '2' : '0';
-    this.outputDir = options.outputDir || path.join(__dirname, '../output');
-    this.tempDir = options.tempDir || path.join(__dirname, '../temp');
-    this.ffmpegPath = this.findFFmpeg();
 
-    // Visual effects settings
-    this.DARK_FILTERS = {
-      cinematic: 'colorbalance=rs=-0.1:gs=-0.1:bs=0.1,curves=preset=darker,vignette=PI/4',
-      moody: 'colorchannelmixer=rr=0.9:gg=0.9:bb=1.1,curves=preset=darker,vignette=PI/5',
-      horror: 'colorbalance=rs=-0.2:bs=0.15,curves=preset=strong_contrast,vignette=PI/3',
-      subtle: 'curves=preset=slightly_darker,vignette=PI/6',
-    };
+    this.width          = options.width     || (isLowMem ? 720  : 1080);
+    this.height         = options.height    || (isLowMem ? 1280 : 1920);
+    this.fps            = options.fps       || (isLowMem ? 24   : 30);
+    this.ffmpegThreads  = isLowMem ? '2' : '0';
+    this.outputDir      = options.outputDir || path.join(__dirname, '../output');
+    this.tempDir        = options.tempDir   || path.join(__dirname, '../temp');
+    this.ffmpegPath     = this.findFFmpeg();
 
-    // Transition effects
-    this.TRANSITIONS = {
-      cut: { duration: 0 },
-      fade: { duration: 0.3, filter: 'fade=t=out:st=DURATION:d=0.3,fade=t=in:st=0:d=0.3' },
-      slide: { duration: 0.2 },
-      zoom: { duration: 0.25 },
-    };
-
-    this.ensureDirs();
+    this._ensureDirs();
   }
 
-  // Flags padrão que vão em todo comando ffmpeg para limitar uso de memória
-  get ff() {
-    return [this.ffmpegPath, '-threads', this.ffmpegThreads];
-  }
+  // ---------------------------------------------------------------------------
+  // FFmpeg helpers
+  // ---------------------------------------------------------------------------
 
-  ensureDirs() {
-    [this.outputDir, this.tempDir].forEach(dir => {
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-    });
-  }
-
+  /**
+   * Locate the FFmpeg binary.
+   * Order: `which ffmpeg` → common paths → ffmpeg-static npm package.
+   *
+   * @returns {string} Absolute path (or bare 'ffmpeg' as last resort)
+   */
   findFFmpeg() {
-    const paths = [
+    // 1. PATH lookup
+    try {
+      const result = execSync('which ffmpeg', { encoding: 'utf8', stdio: 'pipe' }).trim();
+      if (result) return result;
+    } catch (_) {}
+
+    // 2. Common install locations
+    const commonPaths = [
       '/usr/bin/ffmpeg',
       '/usr/local/bin/ffmpeg',
       '/opt/homebrew/bin/ffmpeg',
+      '/snap/bin/ffmpeg',
     ];
-
-    try {
-      const result = execSync('which ffmpeg 2>/dev/null', { encoding: 'utf8' }).trim();
-      if (result) return result;
-    } catch {}
-
-    for (const p of paths) {
+    for (const p of commonPaths) {
       if (fs.existsSync(p)) return p;
     }
 
-    // Try ffmpeg-static
+    // 3. ffmpeg-static npm package
     try {
       const ffmpegStatic = require('ffmpeg-static');
       if (ffmpegStatic) return ffmpegStatic;
-    } catch {}
+    } catch (_) {}
 
-    console.warn('⚠️  FFmpeg not found. Video composition will be limited.');
+    console.warn('VideoComposer: FFmpeg not found — falling back to bare "ffmpeg" in PATH.');
     return 'ffmpeg';
   }
 
   /**
-   * Main composition pipeline
+   * Returns the base FFmpeg invocation array: [binary, '-threads', N]
+   * Spread this at the start of every execSync command string.
+   *
+   * @returns {string[]}
+   */
+  get ff() {
+    return [this.ffmpegPath, '-threads', this.ffmpegThreads];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Main pipeline
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compose a final video from a script + media assets.
+   *
+   * @param {object}   options
+   * @param {object}   options.script         - Parsed script: { title, hook, segments[] }
+   * @param {Array}    [options.mediaFiles]   - Per-segment media: [{ localPath, type }]
+   * @param {string}   [options.audioFile]    - Narrator audio path
+   * @param {string}   [options.outputFileName]
+   * @param {string}   [options.visualStyle]  - Unused visually (filter is fixed); kept for compat
+   * @param {string}   [options.musicFile]    - Background music path
+   * @param {number}   [options.musicVolume]  - Music volume 0–1 (default 0.15)
+   *
+   * @returns {Promise<{ success: boolean, outputPath: string, fileSizeMB: string, fallback?: boolean }>}
    */
   async compose(options) {
     const {
       script,
-      mediaFiles,
+      mediaFiles    = [],
       audioFile,
-      subtitleData,
       outputFileName,
-      visualStyle = 'cinematic',
-      musicFile = null,
-      musicVolume = 0.15,
+      musicFile     = null,
+      musicVolume   = 0.15,
     } = options;
 
-    const outputPath = path.join(this.outputDir, outputFileName || `video_${Date.now()}.mp4`);
-    const sessionId = Date.now();
+    const sessionId  = Date.now();
+    const outputPath = path.join(
+      this.outputDir,
+      outputFileName || `video_${sessionId}.mp4`
+    );
 
-    console.log('\n🎬 Iniciando composição do vídeo...');
-    console.log(`   📐 Formato: ${this.width}x${this.height} (9:16 vertical)`);
-    console.log(`   🎞️  FPS: ${this.fps}`);
-    console.log(`   📁 Saída: ${outputPath}`);
+    console.log('\nVideoComposer: starting pipeline...');
+    console.log(`  Resolution : ${this.width}x${this.height}`);
+    console.log(`  FPS        : ${this.fps}`);
+    console.log(`  Output     : ${outputPath}`);
 
     try {
-      // Step 1: Create image slides with Ken Burns effect
-      const slidePaths = await this.createSlides(mediaFiles, script, sessionId);
+      // ── Step a: Break each segment into micro-clips ──────────────────────
+      const quickCuts = new QuickCuts({
+        ffmpegPath   : this.ffmpegPath,
+        width        : this.width,
+        height       : this.height,
+        fps          : this.fps,
+        tempDir      : this.tempDir,
+        ffmpegThreads: this.ffmpegThreads,
+      });
 
-      // Step 2: Concatenate slides into video
-      const rawVideoPath = await this.concatenateSlides(slidePaths, sessionId);
+      /** @type {Array<{ path: string, duration: number, emotion: string }>} */
+      const allClips = [];
 
-      // Step 3: Apply dark visual filters
-      const filteredVideoPath = await this.applyDarkFilters(rawVideoPath, visualStyle, sessionId);
-
-      // Step 4: Add subtitles
-      const subtitledVideoPath = await this.burnSubtitles(
-        filteredVideoPath, subtitleData, script, sessionId
-      );
-
-      // Step 5: Mix audio (narration + music)
-      const finalVideoPath = await this.mixAudio(
-        subtitledVideoPath, audioFile, musicFile, musicVolume, outputPath
-      );
-
-      // Cleanup temp files
-      await this.cleanup(sessionId, slidePaths);
-
-      console.log(`\n✅ Vídeo gerado com sucesso: ${outputPath}`);
-
-      const stats = fs.statSync(finalVideoPath);
-      return {
-        success: true,
-        outputPath: finalVideoPath,
-        fileSize: stats.size,
-        fileSizeMB: (stats.size / 1024 / 1024).toFixed(2),
-      };
-    } catch (error) {
-      console.error('❌ Erro na composição:', error.message);
-
-      // Fallback: create simple slideshow
-      try {
-        console.log('🔄 Tentando composição alternativa...');
-        const fallbackPath = await this.createFallbackVideo(script, audioFile, outputPath, sessionId);
-        return {
-          success: true,
-          outputPath: fallbackPath,
-          fallback: true,
-        };
-      } catch (fallbackError) {
-        throw new Error(`Composition failed: ${error.message}. Fallback also failed: ${fallbackError.message}`);
+      for (let s = 0; s < script.segments.length; s++) {
+        const segment   = { ...script.segments[s], _index: s };
+        const mediaFile = mediaFiles[s]?.localPath || null;
+        const clips     = await quickCuts.breakSegmentIntoClips(segment, mediaFile, sessionId);
+        allClips.push(...clips);
       }
-    }
-  }
 
-  /**
-   * Create image slides with Ken Burns effect for each segment
-   */
-  async createSlides(mediaFiles, script, sessionId) {
-    const slidePaths = [];
+      console.log(`  Micro-clips generated: ${allClips.length}`);
 
-    console.log('\n🖼️  Criando slides com efeito Ken Burns...');
+      // ── Step b: Insert flash frames every 3rd clip ───────────────────────
+      const flashColors    = ['white', 'red'];
+      /** Final ordered list of clip paths after flash insertions */
+      const processedPaths = [];
 
-    for (let i = 0; i < script.segments.length; i++) {
-      const segment = script.segments[i];
-      const mediaFile = mediaFiles?.[i];
-      const duration = segment.duration || 3;
-      const slidePath = path.join(this.tempDir, `slide_${sessionId}_${i}.mp4`);
+      for (let i = 0; i < allClips.length; i++) {
+        processedPaths.push(allClips[i].path);
 
-      console.log(`   🎞️  Slide ${i + 1}/${script.segments.length} (${duration}s)`);
+        // Insert flash between clip i and i+1 every 3rd clip
+        if ((i + 1) % 3 === 0 && i + 1 < allClips.length) {
+          const flashColor  = flashColors[Math.floor(i / 3) % flashColors.length];
+          const flashedPath = path.join(
+            this.tempDir,
+            `flashed_${sessionId}_${i}.mp4`
+          );
 
-      try {
-        if (mediaFile?.localPath && fs.existsSync(mediaFile.localPath)) {
-          if (mediaFile.type === 'video') {
-            // Use video clip
-            await this.createVideoSlide(mediaFile.localPath, slidePath, duration);
-          } else {
-            // Create Ken Burns from image
-            await this.createKenBurnsSlide(mediaFile.localPath, slidePath, duration, i);
+          try {
+            await quickCuts.addFlashFrame(
+              allClips[i].path,
+              allClips[i + 1].path,
+              flashedPath,
+              flashColor
+            );
+            // Replace last appended path + skip next clip (it's merged into flashedPath)
+            processedPaths.pop();         // remove clip[i]
+            processedPaths.push(flashedPath);
+            i++;                          // skip clip[i+1] — already merged
+          } catch (flashErr) {
+            console.warn(`  Flash frame skipped at clip ${i}: ${flashErr.message}`);
+            // Leave processedPaths as-is, continue normally
           }
-        } else {
-          // Create atmospheric dark background
-          await this.createAtmosphericSlide(slidePath, duration, segment.emotion || 'suspense', i);
         }
-        slidePaths.push(slidePath);
-      } catch (err) {
-        console.error(`   ⚠️  Erro no slide ${i + 1}: ${err.message}`);
-        // Create simple black slide as fallback
-        await this.createBlackSlide(slidePath, duration);
-        slidePaths.push(slidePath);
+      }
+
+      // ── Step c: Concatenate all clips ────────────────────────────────────
+      const concatPath = path.join(this.tempDir, `concat_${sessionId}.mp4`);
+      await this.concatenateClips(processedPaths, concatPath);
+
+      // ── Step d: Apply dark filter (curves + vignette) ────────────────────
+      const filteredPath = path.join(this.tempDir, `filtered_${sessionId}.mp4`);
+      await this.applyDarkFilter(concatPath, filteredPath);
+
+      // ── Step e: Burn subtitles ────────────────────────────────────────────
+      const subtitledPath = path.join(this.tempDir, `subtitled_${sessionId}.mp4`);
+      await this.burnSubtitles(filteredPath, script, subtitledPath, sessionId);
+
+      // ── Step f: Generate whoosh SFX at each cut timestamp ────────────────
+      const cutTimestamps = this._computeCutTimestamps(allClips);
+      const sfxTimings    = await this._generateWhooshEffects(cutTimestamps, sessionId);
+
+      let videoWithSfx = subtitledPath;
+      if (sfxTimings.length > 0) {
+        const sfxPath = path.join(this.tempDir, `sfx_${sessionId}.mp4`);
+        try {
+          FxEngine.addSoundEffectsToVideo(
+            subtitledPath,
+            sfxTimings,
+            sfxPath,
+            this.ffmpegPath,
+            this.ffmpegThreads
+          );
+          videoWithSfx = sfxPath;
+        } catch (sfxErr) {
+          console.warn(`  SFX mixing failed (continuing without): ${sfxErr.message}`);
+        }
+      }
+
+      // ── Step g: Mix final audio ───────────────────────────────────────────
+      await this.mixAudio(videoWithSfx, audioFile, musicFile, musicVolume, outputPath);
+
+      // ── Cleanup ───────────────────────────────────────────────────────────
+      await this.cleanup(sessionId);
+
+      const stats      = fs.statSync(outputPath);
+      const fileSizeMB = (stats.size / 1024 / 1024).toFixed(2);
+      console.log(`\nVideoComposer: done — ${outputPath} (${fileSizeMB} MB)`);
+
+      return { success: true, outputPath, fileSizeMB };
+
+    } catch (err) {
+      console.error(`VideoComposer: pipeline error — ${err.message}`);
+
+      // Fallback: simple canvas title card
+      try {
+        console.log('VideoComposer: attempting fallback title card video...');
+        const fallbackPath = await this.createFallbackVideo(script, audioFile, outputPath);
+        const stats        = fs.statSync(fallbackPath);
+        const fileSizeMB   = (stats.size / 1024 / 1024).toFixed(2);
+        return { success: true, outputPath: fallbackPath, fileSizeMB, fallback: true };
+      } catch (fallbackErr) {
+        throw new Error(
+          `VideoComposer pipeline failed: ${err.message}. ` +
+          `Fallback also failed: ${fallbackErr.message}`
+        );
       }
     }
-
-    return slidePaths;
   }
 
-  /**
-   * Create Ken Burns effect from still image
-   */
-  async createKenBurnsSlide(imagePath, outputPath, duration, slideIndex) {
-    const kenBurnsPresets = [
-      // Zoom in from center
-      `zoompan=z='min(zoom+0.001,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.floor(duration * this.fps)}:s=${this.width}x${this.height}:fps=${this.fps}`,
-      // Pan left to right
-      `zoompan=z='1.1':x='if(lte(on,1),0,x+1)':y='ih/2-(ih/zoom/2)':d=${Math.floor(duration * this.fps)}:s=${this.width}x${this.height}:fps=${this.fps}`,
-      // Zoom out from top-right
-      `zoompan=z='max(zoom-0.001,1)':x='iw*0.7-(iw/zoom/2)':y='ih*0.2-(ih/zoom/2)':d=${Math.floor(duration * this.fps)}:s=${this.width}x${this.height}:fps=${this.fps}`,
-      // Pan diagonal
-      `zoompan=z='1.08':x='if(lte(on,1),0,x+0.5)':y='if(lte(on,1),0,y+0.5)':d=${Math.floor(duration * this.fps)}:s=${this.width}x${this.height}:fps=${this.fps}`,
-      // Slow zoom in from bottom
-      `zoompan=z='min(zoom+0.0008,1.12)':x='iw/2-(iw/zoom/2)':y='ih*0.8-(ih/zoom/2)':d=${Math.floor(duration * this.fps)}:s=${this.width}x${this.height}:fps=${this.fps}`,
-    ];
-
-    const kenBurns = kenBurnsPresets[slideIndex % kenBurnsPresets.length];
-
-    const command = [
-      ...this.ff,
-      '-loop', '1',
-      '-i', `"${imagePath}"`,
-      '-vf', `"scale=${this.width * 2}:${this.height * 2}:force_original_aspect_ratio=increase,crop=${this.width * 2}:${this.height * 2},${kenBurns}"`,
-      '-t', duration.toString(),
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-crf', '28',
-      '-pix_fmt', 'yuv420p',
-      '-an',
-      `"${outputPath}"`,
-      '-y',
-    ].join(' ');
-
-    execSync(command, { stdio: 'pipe', timeout: 60000 });
-  }
+  // ---------------------------------------------------------------------------
+  // Step c — concatenate clips
+  // ---------------------------------------------------------------------------
 
   /**
-   * Create video clip (trim and resize)
+   * Concatenate a list of video clip paths using the FFmpeg concat demuxer.
+   *
+   * @param {string[]} clipPaths
+   * @param {string}   outputPath
    */
-  async createVideoSlide(videoPath, outputPath, duration) {
-    const command = [
-      ...this.ff,
-      '-i', `"${videoPath}"`,
-      '-t', duration.toString(),
-      '-vf', `"scale=${this.width}:${this.height}:force_original_aspect_ratio=increase,crop=${this.width}:${this.height}"`,
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-crf', '28',
-      '-pix_fmt', 'yuv420p',
-      '-an',
-      `"${outputPath}"`,
-      '-y',
-    ].join(' ');
-
-    execSync(command, { stdio: 'pipe', timeout: 60000 });
-  }
-
-  /**
-   * Create atmospheric animated background slide
-   */
-  async createAtmosphericSlide(outputPath, duration, emotion, index) {
-    // Create using canvas then convert to video
-    const framesDir = path.join(this.tempDir, `atm_${Date.now()}_${index}`);
-    fs.mkdirSync(framesDir, { recursive: true });
-
-    const totalFrames = Math.ceil(duration * this.fps);
-    const frameCount = Math.min(totalFrames, 10); // Sample frames for canvas
-
-    // Generate frames
-    for (let f = 0; f < frameCount; f++) {
-      const canvas = createCanvas(this.width, this.height);
-      const ctx = canvas.getContext('2d');
-      const progress = f / frameCount;
-
-      this.drawAtmosphericBackground(ctx, emotion, progress, index);
-
-      const frameBuffer = canvas.toBuffer('image/jpeg', { quality: 0.85 });
-      fs.writeFileSync(path.join(framesDir, `frame_${String(f).padStart(4, '0')}.jpg`), frameBuffer);
+  async concatenateClips(clipPaths, outputPath) {
+    if (!clipPaths || clipPaths.length === 0) {
+      throw new Error('concatenateClips: no clips provided');
     }
 
-    // If only sample frames, duplicate them
-    for (let f = frameCount; f < totalFrames; f++) {
-      const sourceFrame = f % frameCount;
-      const src = path.join(framesDir, `frame_${String(sourceFrame).padStart(4, '0')}.jpg`);
-      const dst = path.join(framesDir, `frame_${String(f).padStart(4, '0')}.jpg`);
-      fs.copyFileSync(src, dst);
-    }
+    const listPath = path.join(this.tempDir, `concatlist_${Date.now()}.txt`);
+    const listContent = clipPaths
+      .map(p => `file '${p.replace(/'/g, "'\\''")}'`)
+      .join('\n');
+    fs.writeFileSync(listPath, listContent, 'utf8');
 
-    // Convert frames to video
-    const command = [
-      ...this.ff,
-      '-framerate', this.fps.toString(),
-      '-i', `"${path.join(framesDir, 'frame_%04d.jpg')}"`,
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-crf', '28',
-      '-pix_fmt', 'yuv420p',
-      '-an',
-      `"${outputPath}"`,
-      '-y',
-    ].join(' ');
-
-    execSync(command, { stdio: 'pipe', timeout: 60000 });
-
-    // Cleanup frames
-    fs.rmSync(framesDir, { recursive: true, force: true });
-  }
-
-  /**
-   * Draw atmospheric background on canvas
-   */
-  drawAtmosphericBackground(ctx, emotion, progress, seed) {
-    // Base dark gradient
-    const colors = {
-      'suspense': ['#050010', '#0a0530'],
-      'revelação': ['#100500', '#300a00'],
-      'choque': ['#100000', '#200505'],
-      'reflexão': ['#000510', '#001020'],
-      'gancho': ['#000510', '#0a001a'],
-    };
-
-    const [color1, color2] = colors[emotion] || colors['suspense'];
-    const gradient = ctx.createLinearGradient(0, 0, 0, this.height);
-    gradient.addColorStop(0, color1);
-    gradient.addColorStop(1, color2);
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, this.width, this.height);
-
-    // Animated particles
-    const particleCount = 80;
-    for (let i = 0; i < particleCount; i++) {
-      const x = ((seed * 137 + i * 71 + progress * 200) % this.width);
-      const y = ((seed * 89 + i * 113 + progress * 150) % this.height);
-      const r = (i % 3) + 1;
-      const alpha = 0.03 + (i % 5) * 0.01;
-
-      ctx.fillStyle = emotion === 'revelação'
-        ? `rgba(255, 100, 0, ${alpha})`
-        : `rgba(100, 50, 255, ${alpha})`;
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Light rays effect
-    ctx.save();
-    ctx.globalAlpha = 0.03 + Math.sin(progress * Math.PI) * 0.02;
-    const rayGradient = ctx.createRadialGradient(
-      this.width / 2, 0, 0,
-      this.width / 2, 0, this.height * 0.8
-    );
-    rayGradient.addColorStop(0, 'rgba(150, 50, 255, 0.4)');
-    rayGradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-    ctx.fillStyle = rayGradient;
-    ctx.fillRect(0, 0, this.width, this.height);
-    ctx.restore();
-  }
-
-  /**
-   * Create simple black slide
-   */
-  async createBlackSlide(outputPath, duration) {
-    const command = [
-      ...this.ff,
-      '-f', 'lavfi',
-      '-i', `color=c=black:s=${this.width}x${this.height}:r=${this.fps}`,
-      '-t', duration.toString(),
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-pix_fmt', 'yuv420p',
-      `"${outputPath}"`,
-      '-y',
-    ].join(' ');
-
-    execSync(command, { stdio: 'pipe', timeout: 30000 });
-  }
-
-  /**
-   * Concatenate all slides with smooth transitions
-   */
-  async concatenateSlides(slidePaths, sessionId) {
-    const listPath = path.join(this.tempDir, `concat_${sessionId}.txt`);
-    const outputPath = path.join(this.tempDir, `raw_${sessionId}.mp4`);
-
-    // Write concat list
-    const listContent = slidePaths.map(p => `file '${p}'\n`).join('');
-    fs.writeFileSync(listPath, listContent);
-
-    const command = [
+    const cmd = [
       ...this.ff,
       '-f', 'concat',
       '-safe', '0',
@@ -392,22 +285,34 @@ class VideoComposer {
       '-preset', 'ultrafast',
       '-crf', '28',
       '-pix_fmt', 'yuv420p',
+      '-an',
       `"${outputPath}"`,
       '-y',
     ].join(' ');
 
-    execSync(command, { stdio: 'pipe', timeout: 120000 });
-    return outputPath;
+    try {
+      execSync(cmd, { stdio: 'pipe', timeout: 120000 });
+    } finally {
+      try { fs.unlinkSync(listPath); } catch (_) {}
+    }
   }
 
-  /**
-   * Apply dark cinematic filters
-   */
-  async applyDarkFilters(inputPath, style, sessionId) {
-    const outputPath = path.join(this.tempDir, `filtered_${sessionId}.mp4`);
-    const filter = this.DARK_FILTERS[style] || this.DARK_FILTERS.cinematic;
+  // ---------------------------------------------------------------------------
+  // Step d — dark filter
+  // ---------------------------------------------------------------------------
 
-    const command = [
+  /**
+   * Apply a light dark/moody filter: curves darkening + vignette.
+   * Deliberately lighter than before to avoid crushing the image on low-end
+   * displays.
+   *
+   * @param {string} inputPath
+   * @param {string} outputPath
+   */
+  async applyDarkFilter(inputPath, outputPath) {
+    const filter = 'curves=preset=slightly_darker,vignette=PI/5';
+
+    const cmd = [
       ...this.ff,
       '-i', `"${inputPath}"`,
       '-vf', `"${filter}"`,
@@ -415,103 +320,150 @@ class VideoComposer {
       '-preset', 'ultrafast',
       '-crf', '28',
       '-pix_fmt', 'yuv420p',
+      '-an',
       `"${outputPath}"`,
       '-y',
     ].join(' ');
 
-    execSync(command, { stdio: 'pipe', timeout: 120000 });
-    return outputPath;
+    execSync(cmd, { stdio: 'pipe', timeout: 120000 });
   }
 
-  /**
-   * Burn subtitles into video using FFmpeg
-   */
-  async burnSubtitles(inputPath, subtitleData, script, sessionId) {
-    const outputPath = path.join(this.tempDir, `subtitled_${sessionId}.mp4`);
+  // ---------------------------------------------------------------------------
+  // Step e — subtitle burning
+  // ---------------------------------------------------------------------------
 
-    // Generate ASS subtitle file
-    const assPath = path.join(this.tempDir, `subs_${sessionId}.ass`);
+  /**
+   * Generate an ASS subtitle file from the script and burn it into the video.
+   * Falls back to passing the video through unchanged if FFmpeg reports an error.
+   *
+   * @param {string} inputPath
+   * @param {object} script      - { segments: [{ text, duration, emotion, emphasis }] }
+   * @param {string} outputPath
+   * @param {string|number} sessionId
+   */
+  async burnSubtitles(inputPath, script, outputPath, sessionId) {
     const SubtitleRenderer = require('./subtitleRenderer');
     const renderer = new SubtitleRenderer({
-      width: this.width,
-      height: this.height,
+      width  : this.width,
+      height : this.height,
+      fps    : this.fps,
     });
 
-    // Create timing data from segments
-    const timingData = [];
-    let currentTime = 0;
-    script.segments.forEach((seg, i) => {
-      const words = seg.text.split(' ');
-      const wordDuration = seg.duration / words.length;
-      words.forEach((word, j) => {
+    // Build per-word timing data from segment durations
+    const timingData  = [];
+    let currentTime   = 0;
+
+    (script.segments || []).forEach((seg, segIdx) => {
+      const words       = (seg.text || '').split(/\s+/).filter(Boolean);
+      const segDuration = seg.duration || 3;
+      const wordDur     = words.length > 0 ? segDuration / words.length : segDuration;
+
+      words.forEach((word, wIdx) => {
         timingData.push({
           word,
-          startTime: currentTime + j * wordDuration,
-          duration: wordDuration,
-          segment: i,
-          isEmphasis: seg.emphasis?.includes(word.toLowerCase()) || false,
-          emotion: seg.emotion,
+          startTime : currentTime + wIdx * wordDur,
+          duration  : wordDur,
+          segment   : segIdx,
+          isEmphasis: Array.isArray(seg.emphasis)
+            ? seg.emphasis.includes(word.toLowerCase())
+            : false,
+          emotion   : seg.emotion || 'suspense',
         });
       });
-      currentTime += seg.duration;
+
+      currentTime += segDuration;
     });
 
-    const subtitleFrames = renderer.generateSubtitleData(timingData, 'tiktok');
-    renderer.generateASSFile(subtitleFrames, assPath, 'tiktok');
+    const assPath = path.join(this.tempDir, `subs_${sessionId}.ass`);
 
-    // Burn subtitles
-    const command = [
+    try {
+      const subtitleFrames = renderer.generateSubtitleData(timingData, 'tiktok');
+      renderer.generateASSFile(subtitleFrames, assPath, 'tiktok');
+    } catch (genErr) {
+      console.warn(`  Subtitle generation failed: ${genErr.message}`);
+      // Copy input to output unmodified
+      fs.copyFileSync(inputPath, outputPath);
+      return;
+    }
+
+    // Escape path for FFmpeg ass filter (colons must be escaped on Windows/cross-platform)
+    const escapedAss = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+
+    const cmd = [
       ...this.ff,
       '-i', `"${inputPath}"`,
-      '-vf', `"ass='${assPath.replace(/\\/g, '/').replace(/:/g, '\\:')}'"`  ,
+      '-vf', `"ass='${escapedAss}'"`,
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
       '-crf', '28',
       '-pix_fmt', 'yuv420p',
+      '-an',
       `"${outputPath}"`,
       '-y',
     ].join(' ');
 
     try {
-      execSync(command, { stdio: 'pipe', timeout: 120000 });
-      return outputPath;
-    } catch (err) {
-      console.warn('⚠️  Subtitle burn failed, using video without burned subs');
-      return inputPath;
+      execSync(cmd, { stdio: 'pipe', timeout: 120000 });
+    } catch (burnErr) {
+      console.warn(`  Subtitle burn failed (using video without subs): ${burnErr.message}`);
+      fs.copyFileSync(inputPath, outputPath);
+    } finally {
+      try { fs.unlinkSync(assPath); } catch (_) {}
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Step g — audio mixing
+  // ---------------------------------------------------------------------------
+
   /**
-   * Mix narration audio with background music
+   * Mix the video's existing track (or silence) with narration + background music.
+   *
+   * Supported combinations:
+   *   - narrator + music  → amix of both (narrator at 1.0, music at musicVolume)
+   *   - narrator only     → direct map
+   *   - music only        → music at musicVolume
+   *   - neither           → -an (no audio)
+   *
+   * @param {string} videoPath
+   * @param {string|null} narratorAudio
+   * @param {string|null} musicFile
+   * @param {number} musicVolume
+   * @param {string} outputPath
    */
-  async mixAudio(videoPath, narratorAudioPath, musicPath, musicVolume, outputPath) {
-    let audioFilter = '';
-    let inputArgs = ['-i', `"${videoPath}"`]; // primeiro input — ffmpegPath fica no this.ff
+  async mixAudio(videoPath, narratorAudio, musicFile, musicVolume, outputPath) {
+    const hasNarrator = narratorAudio && fs.existsSync(narratorAudio);
+    const hasMusic    = musicFile     && fs.existsSync(musicFile);
 
-    if (narratorAudioPath && fs.existsSync(narratorAudioPath)) {
-      inputArgs.push('-i', `"${narratorAudioPath}"`);
+    let audioFilter;
+    const extraInputs = [];
 
-      if (musicPath && fs.existsSync(musicPath)) {
-        inputArgs.push('-i', `"${musicPath}"`);
+    if (hasNarrator && hasMusic) {
+      extraInputs.push(`-i "${narratorAudio}"`);
+      extraInputs.push(`-i "${musicFile}"`);
+      audioFilter =
+        `-filter_complex "[1:a]volume=1.0[nar];[2:a]volume=${musicVolume}[mus];` +
+        `[nar][mus]amix=inputs=2:duration=first:dropout_transition=2[audio]" ` +
+        `-map 0:v -map "[audio]"`;
 
-        // Mix narration + music — simple amix, no aloop (music file is pre-generated long enough)
-        audioFilter = `-filter_complex "[1:a]volume=1.0[nar];[2:a]volume=${musicVolume}[mus];[nar][mus]amix=inputs=2:duration=first:dropout_transition=2[audio]" -map 0:v -map "[audio]"`;
-      } else {
-        // Only narration
-        audioFilter = `-map 0:v -map 1:a`;
-      }
-    } else if (musicPath && fs.existsSync(musicPath)) {
-      // Only music
-      inputArgs.push('-i', `"${musicPath}"`);
-      audioFilter = `-filter_complex "[1:a]volume=${musicVolume}[audio]" -map 0:v -map "[audio]"`;
+    } else if (hasNarrator) {
+      extraInputs.push(`-i "${narratorAudio}"`);
+      audioFilter = `-map 0:v -map 1:a`;
+
+    } else if (hasMusic) {
+      extraInputs.push(`-i "${musicFile}"`);
+      audioFilter =
+        `-filter_complex "[1:a]volume=${musicVolume}[audio]" ` +
+        `-map 0:v -map "[audio]"`;
+
     } else {
-      // No audio
       audioFilter = '-an';
     }
 
-    const command = [
+    const cmd = [
       ...this.ff,
-      ...inputArgs.slice(1), // já tem o ffmpegPath no this.ff
+      `-i "${videoPath}"`,
+      ...extraInputs,
       audioFilter,
       '-c:v', 'copy',
       '-c:a', 'aac',
@@ -521,116 +473,199 @@ class VideoComposer {
       '-y',
     ].join(' ');
 
-    execSync(command, { stdio: 'pipe', timeout: 120000 });
-    return outputPath;
+    execSync(cmd, { stdio: 'pipe', timeout: 120000 });
   }
 
-  /**
-   * Fallback: create simple title card video
-   */
-  async createFallbackVideo(script, audioFile, outputPath, sessionId) {
-    // Create a single title card with the script title
-    const canvas = createCanvas(this.width, this.height);
-    const ctx = canvas.getContext('2d');
+  // ---------------------------------------------------------------------------
+  // Cleanup
+  // ---------------------------------------------------------------------------
 
-    // Dark background
-    const gradient = ctx.createLinearGradient(0, 0, 0, this.height);
-    gradient.addColorStop(0, '#050010');
-    gradient.addColorStop(0.5, '#0a0520');
-    gradient.addColorStop(1, '#000005');
-    ctx.fillStyle = gradient;
+  /**
+   * Remove all temp files created for a given session.
+   *
+   * @param {string|number} sessionId
+   */
+  async cleanup(sessionId) {
+    const sid = String(sessionId);
+
+    const prefixes = [
+      'concat_',
+      'filtered_',
+      'subtitled_',
+      'sfx_',
+      'flashed_',
+      'fallback_frame_',
+      'concatlist_',
+    ];
+
+    // Delete named temp files by pattern
+    let entries = [];
+    try {
+      entries = fs.readdirSync(this.tempDir);
+    } catch (_) {}
+
+    for (const entry of entries) {
+      if (!entry.includes(sid)) continue;
+      const inKnownPrefix = prefixes.some(p => entry.startsWith(p));
+      // Also cover QuickCuts' qc_* files from this session
+      if (inKnownPrefix || entry.startsWith(`qc_${sid}`)) {
+        try {
+          fs.unlinkSync(path.join(this.tempDir, entry));
+        } catch (_) {}
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fallback
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a minimal title card video using canvas (no external media needed).
+   * Used when the main pipeline fails entirely.
+   *
+   * @param {object} script
+   * @param {string|null} audioFile
+   * @param {string} outputPath
+   * @returns {Promise<string>} outputPath
+   */
+  async createFallbackVideo(script, audioFile, outputPath) {
+    const canvas = createCanvas(this.width, this.height);
+    const ctx    = canvas.getContext('2d');
+
+    // Dark gradient background
+    const bg = ctx.createLinearGradient(0, 0, 0, this.height);
+    bg.addColorStop(0,   '#050010');
+    bg.addColorStop(0.5, '#0a0520');
+    bg.addColorStop(1,   '#000005');
+    ctx.fillStyle = bg;
     ctx.fillRect(0, 0, this.width, this.height);
 
     // Title
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = 'bold 80px Arial';
-    ctx.textAlign = 'center';
+    ctx.fillStyle    = '#FFFFFF';
+    ctx.font         = `bold ${Math.floor(this.width * 0.11)}px Arial`;
+    ctx.textAlign    = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(script.title || 'Vídeo Viral', this.width / 2, this.height * 0.3);
+    ctx.shadowColor  = 'rgba(0,0,0,0.9)';
+    ctx.shadowBlur   = 20;
+    ctx.fillText(
+      (script.title || 'Viral Video').slice(0, 40),
+      this.width / 2,
+      this.height * 0.28
+    );
 
-    // Hook
+    // Hook text (word-wrapped)
     ctx.fillStyle = '#FFD700';
-    ctx.font = 'bold 60px Arial';
-    const hookText = script.hook || '';
-    const hookLines = this.wrapText(ctx, hookText, this.width - 100);
+    ctx.font      = `bold ${Math.floor(this.width * 0.08)}px Arial`;
+    const hookLines = this._wrapText(ctx, script.hook || '', this.width - 100);
     hookLines.forEach((line, i) => {
-      ctx.fillText(line, this.width / 2, this.height / 2 + i * 80);
+      ctx.fillText(line, this.width / 2, this.height * 0.5 + i * Math.floor(this.width * 0.1));
     });
 
-    // Save frame
-    const frameBuffer = canvas.toBuffer('image/jpeg', { quality: 0.9 });
-    const framePath = path.join(this.tempDir, `fallback_frame_${sessionId}.jpg`);
-    fs.writeFileSync(framePath, frameBuffer);
+    // Save frame as JPEG
+    const framePath = path.join(this.tempDir, `fallback_frame_${Date.now()}.jpg`);
+    fs.writeFileSync(framePath, canvas.toBuffer('image/jpeg', { quality: 0.9 }));
 
-    const totalDuration = script.segments?.reduce((s, seg) => s + (seg.duration || 3), 0) || 30;
+    const totalDuration = (script.segments || []).reduce((s, seg) => s + (seg.duration || 3), 0) || 30;
+    const hasAudio      = audioFile && fs.existsSync(audioFile);
 
-    // Create video from frame
-    const videoCommand = [
+    const cmd = [
       ...this.ff,
       '-loop', '1',
-      '-i', `"${framePath}"`,
-      audioFile && fs.existsSync(audioFile) ? `-i "${audioFile}"` : '',
-      '-t', totalDuration.toString(),
+      `-i "${framePath}"`,
+      hasAudio ? `-i "${audioFile}"` : '',
+      '-t', String(totalDuration),
       '-vf', `"scale=${this.width}:${this.height}"`,
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
       '-crf', '28',
       '-pix_fmt', 'yuv420p',
-      audioFile && fs.existsSync(audioFile) ? '-c:a aac -shortest' : '-an',
+      hasAudio ? '-c:a aac -b:a 192k -shortest' : '-an',
       `"${outputPath}"`,
       '-y',
     ].filter(Boolean).join(' ');
 
-    execSync(videoCommand, { stdio: 'pipe', timeout: 60000 });
+    execSync(cmd, { stdio: 'pipe', timeout: 60000 });
+
+    try { fs.unlinkSync(framePath); } catch (_) {}
+
     return outputPath;
   }
 
-  /**
-   * Wrap text to multiple lines
-   */
-  wrapText(ctx, text, maxWidth) {
-    const words = text.split(' ');
-    const lines = [];
-    let currentLine = '';
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
 
-    words.forEach(word => {
-      const testLine = currentLine ? `${currentLine} ${word}` : word;
-      const metrics = ctx.measureText(testLine);
-      if (metrics.width > maxWidth && currentLine) {
-        lines.push(currentLine);
-        currentLine = word;
-      } else {
-        currentLine = testLine;
+  _ensureDirs() {
+    [this.outputDir, this.tempDir].forEach(dir => {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    });
+  }
+
+  /**
+   * Compute the absolute start timestamp (ms) of each cut between clips.
+   *
+   * @param {Array<{ duration: number }>} clips
+   * @returns {number[]} Array of timestamps in milliseconds
+   */
+  _computeCutTimestamps(clips) {
+    const timestamps = [];
+    let elapsed      = 0;
+    for (let i = 0; i < clips.length - 1; i++) {
+      elapsed += (clips[i].duration || 1.5) * 1000;
+      timestamps.push(Math.round(elapsed));
+    }
+    return timestamps;
+  }
+
+  /**
+   * Generate a whoosh .mp3 for every cut timestamp and return the timing array
+   * expected by FxEngine.addSoundEffectsToVideo.
+   *
+   * @param {number[]} timestamps  - Cut positions in ms
+   * @param {string|number} sessionId
+   * @returns {Promise<Array<{ file: string, timeMs: number }>>}
+   */
+  async _generateWhooshEffects(timestamps, sessionId) {
+    const timings = [];
+
+    for (let i = 0; i < timestamps.length; i++) {
+      const sfxPath = path.join(this.tempDir, `whoosh_${sessionId}_${i}.mp3`);
+      try {
+        FxEngine.generateWhoosh(sfxPath, this.ffmpegPath);
+        timings.push({ file: sfxPath, timeMs: timestamps[i] });
+      } catch (err) {
+        console.warn(`  Whoosh ${i} skipped: ${err.message}`);
       }
-    });
-    if (currentLine) lines.push(currentLine);
-    return lines;
+    }
+
+    return timings;
   }
 
   /**
-   * Cleanup temporary files
+   * Wrap `text` into lines no wider than `maxWidth` pixels.
+   *
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {string} text
+   * @param {number} maxWidth
+   * @returns {string[]}
    */
-  async cleanup(sessionId, slidePaths = []) {
-    const patterns = [
-      path.join(this.tempDir, `*_${sessionId}.*`),
-      path.join(this.tempDir, `concat_${sessionId}.txt`),
-    ];
+  _wrapText(ctx, text, maxWidth) {
+    const words = String(text || '').split(' ');
+    const lines = [];
+    let line    = '';
 
-    // Delete slide files
-    slidePaths.forEach(p => {
-      if (fs.existsSync(p)) fs.unlinkSync(p);
-    });
-
-    // Delete temp video files
-    ['raw_', 'filtered_', 'subtitled_', 'fallback_frame_'].forEach(prefix => {
-      const ext = prefix.includes('frame') ? '.jpg' : '.mp4';
-      const p = path.join(this.tempDir, `${prefix}${sessionId}${ext}`);
-      if (fs.existsSync(p)) fs.unlinkSync(p);
-    });
-  }
-
-  getAvailableStyles() {
-    return Object.keys(this.DARK_FILTERS);
+    for (const word of words) {
+      const test = line ? `${line} ${word}` : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
+    }
+    if (line) lines.push(line);
+    return lines;
   }
 }
 

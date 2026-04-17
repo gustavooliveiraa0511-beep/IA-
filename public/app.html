@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DarkViral — Dashboard</title>
+  <style>
+    /* ── Reset & Base ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:       #08080f;
+      --bg2:      #0e0e1c;
+      --bg3:      #14142a;
+      --border:   #1e1e38;
+      --purple:   #7c3aed;
+      --purple2:  #9f5fff;
+      --purple3:  #c084fc;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --success:  #22c55e;
+      --gold:     #f59e0b;
+      --red:      #ef4444;
+      --radius:   14px;
+    }
+    html, body { height: 100%; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+    button { font-family: inherit; cursor: pointer; }
+    a { color: inherit; text-decoration: none; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    /* ════════════════════════
+       NAVBAR
+    ════════════════════════ */
+    .navbar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      background: rgba(8,8,15,0.92);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .navbar-left { display: flex; align-items: center; gap: 12px; }
+    .navbar-logo { font-size: 1.15rem; font-weight: 900; color: #fff; }
+    .navbar-logo span { color: var(--purple2); }
+    .navbar-right { display: flex; align-items: center; gap: 12px; }
+    .user-info { display: flex; align-items: center; gap: 10px; }
+    .user-email {
+      font-size: .83rem;
+      color: var(--muted);
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .plan-badge {
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: .7rem;
+      font-weight: 800;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .plan-free { background: rgba(100,116,139,0.2); color: var(--muted); border: 1px solid var(--border); }
+    .plan-pro  { background: rgba(124,58,237,0.2); color: var(--purple2); border: 1px solid rgba(124,58,237,0.3); }
+    .btn-logout {
+      padding: 7px 16px;
+      border: 1.5px solid var(--border);
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font-size: .8rem;
+      font-weight: 600;
+      transition: all .2s;
+    }
+    .btn-logout:hover { border-color: var(--red); color: var(--red); }
+
+    /* ════════════════════════
+       LAYOUT
+    ════════════════════════ */
+    .app-layout {
+      display: flex;
+      min-height: calc(100vh - 60px);
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      background: var(--bg2);
+      border-right: 1px solid var(--border);
+      padding: 24px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .sidebar-btn {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 14px;
+      border: none;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--muted);
+      font-size: .875rem;
+      font-weight: 600;
+      text-align: left;
+      width: 100%;
+      transition: all .2s;
+    }
+    .sidebar-btn:hover { background: var(--bg3); color: var(--text); }
+    .sidebar-btn.active { background: rgba(124,58,237,0.15); color: var(--purple2); }
+    .sidebar-btn .icon { font-size: 1.1rem; }
+
+    /* Main content */
+    .main-content {
+      flex: 1;
+      min-width: 0;
+      padding: 28px 28px 60px;
+      overflow-y: auto;
+    }
+
+    /* Tab panels */
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ════════════════════════
+       CARDS
+    ════════════════════════ */
+    .card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 18px;
+    }
+    .card-title {
+      font-size: .95rem;
+      font-weight: 700;
+      color: var(--purple2);
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* ════════════════════════
+       FORM ELEMENTS
+    ════════════════════════ */
+    .form-label {
+      display: block;
+      font-size: .75rem;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 7px;
+    }
+    .form-input, .form-select {
+      width: 100%;
+      background: var(--bg3);
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 14px;
+      color: var(--text);
+      font-size: .9rem;
+      transition: border-color .2s;
+      margin-bottom: 16px;
+      font-family: inherit;
+    }
+    .form-input:focus, .form-select:focus {
+      outline: none;
+      border-color: var(--purple);
+    }
+    .form-input::placeholder { color: var(--muted); }
+    .form-select { cursor: pointer; }
+
+    /* Pills */
+    .pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    .pill {
+      padding: 7px 16px;
+      border-radius: 999px;
+      border: 1.5px solid var(--border);
+      background: var(--bg3);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: .82rem;
+      font-weight: 700;
+      transition: all .2s;
+      user-select: none;
+    }
+    .pill:hover  { border-color: var(--purple); color: var(--text); }
+    .pill.active { border-color: var(--purple); background: rgba(124,58,237,0.18); color: var(--purple2); }
+
+    /* Topic chips */
+    .chips-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+    .chip {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: .78rem;
+      color: var(--muted);
+      cursor: pointer;
+      transition: all .18s;
+    }
+    .chip:hover { border-color: var(--purple); color: var(--text); }
+
+    /* Slider */
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .slider-row input[type="range"] {
+      flex: 1;
+      accent-color: var(--purple);
+      cursor: pointer;
+      height: 5px;
+    }
+    .slider-val { font-size: .875rem; font-weight: 700; color: var(--purple2); min-width: 36px; text-align: right; }
+
+    /* API keys collapsible */
+    .collapsible-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      padding: 10px 0;
+      color: var(--muted);
+      font-size: .82rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      border-top: 1px solid var(--border);
+      margin-top: 4px;
+      margin-bottom: 0;
+      user-select: none;
+      transition: color .2s;
+    }
+    .collapsible-header:hover { color: var(--text); }
+    .collapsible-body { display: none; padding-top: 14px; }
+    .collapsible-body.open { display: block; }
+
+    /* Generate button */
+    .btn-generate {
+      width: 100%;
+      padding: 15px;
+      background: linear-gradient(135deg, var(--purple), #5b21b6);
+      border: none;
+      border-radius: 12px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 800;
+      letter-spacing: .02em;
+      margin-top: 8px;
+      transition: all .25s;
+      box-shadow: 0 4px 24px rgba(124,58,237,0.3);
+    }
+    .btn-generate:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 32px rgba(124,58,237,0.45);
+    }
+    .btn-generate:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* Usage counter */
+    .usage-bar-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .usage-bar-track {
+      flex: 1;
+      height: 6px;
+      background: var(--bg3);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .usage-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--purple), var(--purple2));
+      border-radius: 999px;
+      transition: width .5s ease;
+    }
+    .usage-text { font-size: .78rem; color: var(--muted); white-space: nowrap; }
+
+    /* ════════════════════════
+       PROGRESS
+    ════════════════════════ */
+    #progressCard { display: none; }
+    .progress-pct {
+      font-size: 1.8rem;
+      font-weight: 900;
+      color: var(--purple2);
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .progress-bar-wrap {
+      background: var(--bg3);
+      border-radius: 999px;
+      height: 8px;
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, var(--purple), var(--purple2));
+      border-radius: 999px;
+      transition: width .4s ease;
+      width: 0%;
+    }
+    .log-box {
+      background: #000;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: .78rem;
+      font-family: 'Courier New', monospace;
+      color: #6ee7b7;
+      max-height: 150px;
+      overflow-y: auto;
+      line-height: 1.7;
+    }
+    .log-box .err  { color: var(--red); }
+    .log-box .warn { color: var(--gold); }
+
+    /* ════════════════════════
+       RESULT
+    ════════════════════════ */
+    #resultCard { display: none; }
+    .video-wrap {
+      border-radius: 12px;
+      overflow: hidden;
+      background: #000;
+      margin-bottom: 14px;
+      aspect-ratio: 9/16;
+      max-height: 400px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .video-wrap video { width: 100%; height: 100%; object-fit: contain; }
+    .btn-download {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 13px;
+      background: var(--success);
+      border: none;
+      border-radius: 11px;
+      color: #fff;
+      font-size: .95rem;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      margin-bottom: 10px;
+      transition: opacity .2s;
+    }
+    .btn-download:hover { opacity: .9; }
+    .btn-new-video {
+      display: block;
+      text-align: center;
+      color: var(--muted);
+      font-size: .82rem;
+      cursor: pointer;
+      padding: 8px;
+      background: none;
+      border: none;
+      width: 100%;
+      text-decoration: underline;
+    }
+    .btn-new-video:hover { color: var(--text); }
+
+    /* ════════════════════════
+       ERROR CARD
+    ════════════════════════ */
+    #errorCard { display: none; }
+    .error-msg {
+      background: rgba(239,68,68,.1);
+      border: 1px solid rgba(239,68,68,.3);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: #f87171;
+      font-size: .875rem;
+    }
+
+    /* ════════════════════════
+       VIDEOS TAB
+    ════════════════════════ */
+    .videos-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .video-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      transition: all .2s;
+    }
+    .video-card:hover { border-color: rgba(124,58,237,0.35); transform: translateY(-2px); }
+    .video-card-icon { font-size: 2rem; margin-bottom: 10px; }
+    .video-card-title {
+      font-size: .9rem;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 5px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .video-card-meta { font-size: .75rem; color: var(--muted); margin-bottom: 12px; }
+    .video-card-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: .72rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 999px;
+      margin-bottom: 12px;
+    }
+    .status-done       { background: rgba(34,197,94,.15); color: var(--success); }
+    .status-processing { background: rgba(245,158,11,.15); color: var(--gold); }
+    .status-error      { background: rgba(239,68,68,.15); color: #f87171; }
+    .video-card-actions { display: flex; gap: 8px; }
+    .btn-card-download {
+      flex: 1;
+      padding: 8px;
+      background: rgba(34,197,94,.12);
+      border: 1px solid rgba(34,197,94,.25);
+      border-radius: 8px;
+      color: var(--success);
+      font-size: .78rem;
+      font-weight: 700;
+      text-align: center;
+      transition: all .2s;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn-card-download:hover { background: rgba(34,197,94,.2); }
+    .btn-card-delete {
+      padding: 8px 10px;
+      background: rgba(239,68,68,.1);
+      border: 1px solid rgba(239,68,68,.2);
+      border-radius: 8px;
+      color: #f87171;
+      font-size: .78rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .btn-card-delete:hover { background: rgba(239,68,68,.2); }
+
+    /* Empty state */
+    .empty-state {
+      text-align: center;
+      padding: 60px 24px;
+      color: var(--muted);
+    }
+    .empty-state-icon { font-size: 3rem; margin-bottom: 14px; }
+    .empty-state h3 { font-size: 1.1rem; font-weight: 700; color: var(--text); margin-bottom: 8px; }
+    .empty-state p  { font-size: .875rem; margin-bottom: 20px; }
+
+    /* ════════════════════════
+       MOBILE TAB BAR
+    ════════════════════════ */
+    .mobile-tabbar {
+      display: none;
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      background: var(--bg2);
+      border-top: 1px solid var(--border);
+      z-index: 50;
+      padding: 8px 0 env(safe-area-inset-bottom, 0);
+    }
+    .mobile-tabbar-inner { display: flex; }
+    .mobile-tab-btn {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      padding: 8px;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-size: .7rem;
+      font-weight: 700;
+      transition: color .2s;
+    }
+    .mobile-tab-btn .icon { font-size: 1.25rem; }
+    .mobile-tab-btn.active { color: var(--purple2); }
+
+    /* ════════════════════════
+       RESPONSIVE
+    ════════════════════════ */
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .mobile-tabbar { display: block; }
+      .main-content { padding: 20px 16px 80px; }
+      .navbar { padding: 0 16px; }
+      .user-email { max-width: 120px; }
+    }
+    @media (max-width: 480px) {
+      .videos-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══ NAVBAR ════════════════════════════════════════════ -->
+<nav class="navbar">
+  <div class="navbar-left">
+    <div class="navbar-logo">Dark<span>Viral</span></div>
+  </div>
+  <div class="navbar-right">
+    <div class="user-info">
+      <span class="user-email" id="navEmail">…</span>
+      <span class="plan-badge plan-free" id="navPlan">Free</span>
+    </div>
+    <button class="btn-logout" onclick="logout()">Sair</button>
+  </div>
+</nav>
+
+<!-- ══ APP LAYOUT ═════════════════════════════════════════ -->
+<div class="app-layout">
+
+  <!-- Sidebar (desktop) -->
+  <aside class="sidebar">
+    <button class="sidebar-btn active" id="sideNewVideo" onclick="switchTab('newVideo')">
+      <span class="icon">⚡</span> Novo Vídeo
+    </button>
+    <button class="sidebar-btn" id="sideMyVideos" onclick="switchTab('myVideos')">
+      <span class="icon">🎬</span> Meus Vídeos
+    </button>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main-content">
+
+    <!-- ─── TAB: Novo Vídeo ─────────────────────────── -->
+    <div id="panelNewVideo" class="tab-panel active">
+
+      <!-- Form card -->
+      <div id="formCard" class="card">
+        <div class="card-title">⚡ Novo Vídeo</div>
+
+        <!-- Usage bar -->
+        <div class="usage-bar-wrap">
+          <div class="usage-bar-track">
+            <div class="usage-bar-fill" id="usageFill" style="width:0%"></div>
+          </div>
+          <span class="usage-text" id="usageText">0/5 usados</span>
+        </div>
+
+        <!-- Topic -->
+        <label class="form-label">Tema do vídeo</label>
+        <input class="form-input" id="topicInput" type="text" placeholder="Ex: segredos da mente humana…">
+        <div class="chips-wrap" id="chipsWrap"></div>
+
+        <!-- Style -->
+        <label class="form-label">Estilo</label>
+        <div class="pills" id="stylePills">
+          <div class="pill active" data-val="dark">🌑 Dark</div>
+          <div class="pill" data-val="emotional">💜 Emocional</div>
+          <div class="pill" data-val="informative">🔎 Informativo</div>
+        </div>
+
+        <!-- Voice -->
+        <label class="form-label">Voz</label>
+        <select class="form-select" id="voiceSelect">
+          <option value="dark-male">🎙️ Masculina dark (grave)</option>
+          <option value="dark-female">🎙️ Feminina dark (sussurro)</option>
+          <option value="narrator">🎙️ Narrador dramático</option>
+        </select>
+
+        <!-- Visual -->
+        <label class="form-label">Estilo visual</label>
+        <select class="form-select" id="visualSelect">
+          <option value="cinematic">🎥 Cinemático</option>
+          <option value="moody">🌫️ Sombrio</option>
+          <option value="horror">😱 Horror</option>
+          <option value="subtle">✨ Sutil</option>
+        </select>
+
+        <!-- Duration -->
+        <label class="form-label">Duração</label>
+        <div class="slider-row">
+          <span style="font-size:.78rem;color:var(--muted)">15s</span>
+          <input type="range" id="durationSlider" min="15" max="60" step="5" value="30">
+          <span style="font-size:.78rem;color:var(--muted)">60s</span>
+          <span class="slider-val" id="durationVal">30s</span>
+        </div>
+
+        <!-- API Keys (collapsible) -->
+        <div class="collapsible-header" onclick="toggleApiKeys()" id="apiKeysHeader">
+          <span>⚙️ API Keys (opcional)</span>
+          <span id="apiKeysArrow">▼</span>
+        </div>
+        <div class="collapsible-body" id="apiKeysBody">
+          <label class="form-label" style="margin-top:4px">
+            Groq API Key
+            <span style="color:var(--success);font-size:.7rem;font-weight:500;text-transform:none"> — grátis em console.groq.com</span>
+          </label>
+          <input class="form-input" id="groqKey" type="password" placeholder="gsk_…" autocomplete="off">
+          <label class="form-label">
+            Pexels API Key
+            <span style="color:var(--success);font-size:.7rem;font-weight:500;text-transform:none"> — melhora imagens</span>
+          </label>
+          <input class="form-input" id="pexelsKey" type="password" placeholder="Opcional" autocomplete="off">
+        </div>
+
+        <!-- Generate button -->
+        <button class="btn-generate" id="btnGenerate" onclick="generate()">
+          ⚡ Gerar Vídeo <span id="btnUsageLabel">(0/5 usados)</span>
+        </button>
+      </div>
+
+      <!-- Progress card -->
+      <div id="progressCard" class="card">
+        <div class="card-title">⏳ Gerando seu vídeo…</div>
+        <div class="progress-pct" id="progressPct">0%</div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="log-box" id="logBox"></div>
+      </div>
+
+      <!-- Result card -->
+      <div id="resultCard" class="card">
+        <div class="card-title">🎉 Vídeo pronto!</div>
+        <div class="video-wrap">
+          <video id="videoPlayer" controls playsinline></video>
+        </div>
+        <a id="btnDownload" class="btn-download" download>⬇️ Baixar Vídeo (.mp4)</a>
+        <button class="btn-new-video" onclick="resetToForm()">+ Criar outro vídeo</button>
+      </div>
+
+      <!-- Error card -->
+      <div id="errorCard" class="card">
+        <div class="card-title">❌ Algo deu errado</div>
+        <div class="error-msg" id="errorMsg"></div>
+        <br>
+        <button class="btn-new-video" onclick="resetToForm()">← Tentar novamente</button>
+      </div>
+
+    </div><!-- /panelNewVideo -->
+
+    <!-- ─── TAB: Meus Vídeos ────────────────────────── -->
+    <div id="panelMyVideos" class="tab-panel">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;">
+        <h2 style="font-size:1.2rem;font-weight:800;color:#fff;">Meus Vídeos</h2>
+        <button onclick="loadVideos()" style="padding:7px 14px;border:1.5px solid var(--border);border-radius:8px;background:transparent;color:var(--muted);font-size:.8rem;font-weight:600;cursor:pointer;transition:all .2s;" onmouseover="this.style.borderColor='var(--purple)'" onmouseout="this.style.borderColor='var(--border)'">↻ Atualizar</button>
+      </div>
+      <div id="videosContainer">
+        <div class="empty-state">
+          <div class="empty-state-icon">🎬</div>
+          <h3>Carregando vídeos…</h3>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ══ MOBILE TAB BAR ════════════════════════════════════ -->
+<div class="mobile-tabbar">
+  <div class="mobile-tabbar-inner">
+    <button class="mobile-tab-btn active" id="mobileNewVideo" onclick="switchTab('newVideo')">
+      <span class="icon">⚡</span>
+      <span>Novo Vídeo</span>
+    </button>
+    <button class="mobile-tab-btn" id="mobileMyVideos" onclick="switchTab('myVideos')">
+      <span class="icon">🎬</span>
+      <span>Meus Vídeos</span>
+    </button>
+  </div>
+</div>
+
+<script>
+// ════════════════════════════════════════════════════
+//  AUTH CHECK
+// ════════════════════════════════════════════════════
+const TOKEN = localStorage.getItem('dvv_token');
+if (!TOKEN) {
+  window.location.href = '/';
+}
+
+// ════════════════════════════════════════════════════
+//  STATE
+// ════════════════════════════════════════════════════
+let selectedStyle = 'dark';
+let userQuota     = { current: 0, limit: 5, plan: 'free' };
+
+// ════════════════════════════════════════════════════
+//  API HELPER
+// ════════════════════════════════════════════════════
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${TOKEN}`,
+      ...(options.headers || {}),
+    },
+  });
+
+  if (res.status === 401) {
+    logout();
+    throw new Error('Sessão expirada');
+  }
+
+  return res;
+}
+
+// ════════════════════════════════════════════════════
+//  INIT
+// ════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', async () => {
+  await loadUserInfo();
+  loadTopics();
+  initStylePills();
+  initSlider();
+});
+
+async function loadUserInfo() {
+  try {
+    const res  = await api('/api/auth/me');
+    const user = await res.json();
+
+    // Navbar
+    document.getElementById('navEmail').textContent = user.email || '';
+    const planBadge = document.getElementById('navPlan');
+    planBadge.textContent = user.plan === 'pro' ? 'Pro' : 'Free';
+    planBadge.className   = 'plan-badge ' + (user.plan === 'pro' ? 'plan-pro' : 'plan-free');
+
+    // Quota
+    userQuota = {
+      current: user.videosUsed  || 0,
+      limit:   user.videosLimit || 5,
+      plan:    user.plan        || 'free',
+    };
+
+    updateUsageDisplay();
+  } catch (err) {
+    console.error('Failed to load user info:', err);
+  }
+}
+
+function updateUsageDisplay() {
+  const { current, limit } = userQuota;
+  const pct = limit > 0 ? Math.min(100, (current / limit) * 100) : 100;
+
+  document.getElementById('usageFill').style.width = pct + '%';
+  document.getElementById('usageText').textContent = `${current}/${limit} usados este mês`;
+  document.getElementById('btnUsageLabel').textContent = `(${current}/${limit} usados)`;
+
+  // Disable generate if limit reached
+  if (current >= limit) {
+    const btn = document.getElementById('btnGenerate');
+    btn.disabled = true;
+    btn.textContent = '🚫 Limite atingido — Faça upgrade para Pro';
+  }
+}
+
+// ════════════════════════════════════════════════════
+//  TOPICS
+// ════════════════════════════════════════════════════
+async function loadTopics() {
+  try {
+    const res    = await fetch('/api/topics');
+    const topics = await res.json();
+    const wrap   = document.getElementById('chipsWrap');
+
+    topics.slice(0, 8).forEach(t => {
+      const chip = document.createElement('div');
+      chip.className   = 'chip';
+      chip.textContent = t;
+      chip.onclick     = () => { document.getElementById('topicInput').value = t; };
+      wrap.appendChild(chip);
+    });
+  } catch {}
+}
+
+// ════════════════════════════════════════════════════
+//  UI INIT
+// ════════════════════════════════════════════════════
+function initStylePills() {
+  document.querySelectorAll('#stylePills .pill').forEach(p => {
+    p.addEventListener('click', () => {
+      document.querySelectorAll('#stylePills .pill').forEach(x => x.classList.remove('active'));
+      p.classList.add('active');
+      selectedStyle = p.dataset.val;
+    });
+  });
+}
+
+function initSlider() {
+  const slider = document.getElementById('durationSlider');
+  slider.addEventListener('input', () => {
+    document.getElementById('durationVal').textContent = slider.value + 's';
+  });
+}
+
+function toggleApiKeys() {
+  const body  = document.getElementById('apiKeysBody');
+  const arrow = document.getElementById('apiKeysArrow');
+  const open  = body.classList.contains('open');
+  body.classList.toggle('open', !open);
+  arrow.textContent = open ? '▼' : '▲';
+}
+
+// ════════════════════════════════════════════════════
+//  TAB SWITCHING
+// ════════════════════════════════════════════════════
+function switchTab(tab) {
+  const isNew = tab === 'newVideo';
+
+  // Panels
+  document.getElementById('panelNewVideo').className = 'tab-panel' + (isNew ? ' active' : '');
+  document.getElementById('panelMyVideos').className = 'tab-panel' + (!isNew ? ' active' : '');
+
+  // Sidebar
+  document.getElementById('sideNewVideo').className = 'sidebar-btn' + (isNew ? ' active' : '');
+  document.getElementById('sideMyVideos').className = 'sidebar-btn' + (!isNew ? ' active' : '');
+
+  // Mobile bar
+  document.getElementById('mobileNewVideo').className = 'mobile-tab-btn' + (isNew ? ' active' : '');
+  document.getElementById('mobileMyVideos').className = 'mobile-tab-btn' + (!isNew ? ' active' : '');
+
+  if (!isNew) loadVideos();
+}
+
+// ════════════════════════════════════════════════════
+//  GENERATE
+// ════════════════════════════════════════════════════
+async function generate() {
+  const topic    = document.getElementById('topicInput').value.trim();
+  const duration = parseInt(document.getElementById('durationSlider').value);
+  const voice    = document.getElementById('voiceSelect').value;
+  const visual   = document.getElementById('visualSelect').value;
+  const groqKey  = document.getElementById('groqKey').value.trim();
+  const pexKey   = document.getElementById('pexelsKey').value.trim();
+
+  showCard('progressCard');
+  document.getElementById('logBox').innerHTML        = '';
+  document.getElementById('progressBar').style.width = '0%';
+  document.getElementById('progressPct').textContent = '0%';
+  document.getElementById('btnGenerate').disabled    = true;
+
+  try {
+    const startRes = await api('/api/generate', {
+      method: 'POST',
+      body: JSON.stringify({
+        topic:        topic || undefined,
+        style:        selectedStyle,
+        duration,
+        voiceProfile: voice,
+        visualStyle:  visual,
+        groqApiKey:   groqKey  || undefined,
+        pexelsApiKey: pexKey   || undefined,
+      }),
+    });
+
+    if (!startRes.ok) {
+      const data = await startRes.json();
+      throw new Error(data.error || 'Falha ao iniciar geração');
+    }
+
+    const { jobId } = await startRes.json();
+    await watchProgress(jobId);
+
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+// ════════════════════════════════════════════════════
+//  SSE PROGRESS
+// ════════════════════════════════════════════════════
+function watchProgress(jobId) {
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(`/api/status/${jobId}`, {
+      // Custom headers not supported in EventSource; auth is verified server-side via cookie fallback
+      // We'll use the jobId-owner check in the server
+    });
+
+    // Workaround: EventSource can't send Authorization header.
+    // Server already checks ownership by userId stored in the job.
+    // If auth fails, the server closes with an error event.
+
+    es.onmessage = (e) => {
+      let data;
+      try { data = JSON.parse(e.data); } catch { return; }
+
+      if (data.error && !data.status) {
+        es.close();
+        return reject(new Error(data.error));
+      }
+
+      // Progress bar
+      if (data.progress !== undefined) {
+        document.getElementById('progressBar').style.width  = data.progress + '%';
+        document.getElementById('progressPct').textContent  = data.progress + '%';
+      }
+
+      // Log
+      if (data.log?.length) {
+        const box = document.getElementById('logBox');
+        box.innerHTML = data.log.map(l => {
+          if (l.startsWith('❌')) return `<div class="err">${esc(l)}</div>`;
+          if (l.startsWith('⚠️')) return `<div class="warn">${esc(l)}</div>`;
+          return `<div>${esc(l)}</div>`;
+        }).join('');
+        box.scrollTop = box.scrollHeight;
+      }
+
+      if (data.status === 'done') {
+        es.close();
+        showResult(jobId);
+        // Refresh quota
+        loadUserInfo();
+        resolve();
+      } else if (data.status === 'error') {
+        es.close();
+        reject(new Error(data.error || 'Erro desconhecido'));
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      pollFallback(jobId, resolve, reject);
+    };
+  });
+}
+
+// ── Polling fallback ──────────────────────────────────
+async function pollFallback(jobId, resolve, reject) {
+  for (let i = 0; i < 120; i++) {
+    await sleep(2000);
+    try {
+      const res  = await api(`/api/status/${jobId}`);
+      const text = await res.text();
+      const lines = text.split('\n').filter(l => l.startsWith('data:'));
+      if (lines.length) {
+        const last = JSON.parse(lines[lines.length - 1].slice(5));
+        if (last.progress !== undefined) {
+          document.getElementById('progressBar').style.width = last.progress + '%';
+          document.getElementById('progressPct').textContent = last.progress + '%';
+        }
+        if (last.log?.length) {
+          const box = document.getElementById('logBox');
+          box.innerHTML = last.log.map(l => `<div>${esc(l)}</div>`).join('');
+          box.scrollTop = box.scrollHeight;
+        }
+        if (last.status === 'done') { showResult(jobId); loadUserInfo(); return resolve(); }
+        if (last.status === 'error') return reject(new Error(last.error));
+      }
+    } catch {}
+  }
+  reject(new Error('Tempo esgotado. Tente novamente.'));
+}
+
+// ════════════════════════════════════════════════════
+//  RESULT
+// ════════════════════════════════════════════════════
+function showResult(jobId) {
+  const videoUrl = `/api/download/${jobId}`;
+  document.getElementById('videoPlayer').src   = videoUrl;
+  document.getElementById('btnDownload').href  = videoUrl;
+  showCard('resultCard');
+  document.getElementById('btnGenerate').disabled = false;
+}
+
+function showError(msg) {
+  document.getElementById('errorMsg').textContent = msg;
+  showCard('errorCard');
+  document.getElementById('btnGenerate').disabled = false;
+}
+
+function resetToForm() {
+  showCard('formCard');
+}
+
+function showCard(id) {
+  ['formCard', 'progressCard', 'resultCard', 'errorCard'].forEach(c => {
+    document.getElementById(c).style.display = c === id ? 'block' : 'none';
+  });
+}
+
+// ════════════════════════════════════════════════════
+//  MY VIDEOS
+// ════════════════════════════════════════════════════
+async function loadVideos() {
+  const container = document.getElementById('videosContainer');
+  container.innerHTML = `
+    <div class="empty-state">
+      <div class="empty-state-icon">⏳</div>
+      <h3>Carregando…</h3>
+    </div>`;
+
+  try {
+    const res    = await api('/api/videos');
+    const videos = await res.json();
+
+    if (!Array.isArray(videos) || videos.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">🎬</div>
+          <h3>Nenhum vídeo ainda.</h3>
+          <p>Crie seu primeiro vídeo viral agora!</p>
+          <button onclick="switchTab('newVideo')" style="padding:11px 24px;background:var(--purple);border:none;border-radius:10px;color:#fff;font-weight:700;cursor:pointer;font-size:.9rem;">
+            ⚡ Criar Agora
+          </button>
+        </div>`;
+      return;
+    }
+
+    const grid = document.createElement('div');
+    grid.className = 'videos-grid';
+
+    videos.forEach(v => {
+      const card = document.createElement('div');
+      card.className = 'video-card';
+
+      const date  = new Date(v.created_at).toLocaleDateString('pt-BR');
+      const title = v.title || v.topic || 'Vídeo dark viral';
+      const status = v.status || 'processing';
+
+      const statusLabels = { done: '✅ Pronto', processing: '⏳ Processando', error: '❌ Erro' };
+      const statusClasses = { done: 'status-done', processing: 'status-processing', error: 'status-error' };
+
+      const canDownload = status === 'done' && v.file_path;
+
+      card.innerHTML = `
+        <div class="video-card-icon">🎬</div>
+        <div class="video-card-title" title="${esc(title)}">${esc(title)}</div>
+        <div class="video-card-meta">${date}</div>
+        <div class="video-card-status ${statusClasses[status] || 'status-processing'}">
+          ${statusLabels[status] || status}
+        </div>
+        <div class="video-card-actions">
+          ${canDownload
+            ? `<a class="btn-card-download" href="/api/download/${esc(findJobId(v.id) || '')}" download>⬇️ Baixar</a>`
+            : `<span style="flex:1;padding:8px;color:var(--muted);font-size:.78rem;text-align:center;">${status === 'processing' ? 'Gerando…' : '—'}</span>`
+          }
+          <button class="btn-card-delete" onclick="deleteVideo('${v.id}', this)">🗑</button>
+        </div>`;
+
+      grid.appendChild(card);
+    });
+
+    container.innerHTML = '';
+    container.appendChild(grid);
+  } catch (err) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">❌</div>
+        <h3>Erro ao carregar vídeos</h3>
+        <p>${esc(err.message)}</p>
+      </div>`;
+  }
+}
+
+function findJobId(dbVideoId) {
+  // Look up in-memory job ID that corresponds to this DB video
+  // We fall back to a download-by-dbVideoId endpoint hint
+  return dbVideoId;
+}
+
+async function deleteVideo(videoId, btn) {
+  if (!confirm('Deletar este vídeo?')) return;
+  btn.disabled = true;
+  try {
+    const res = await api(`/api/videos/${videoId}`, { method: 'DELETE' });
+    if (res.ok) {
+      loadVideos();
+    } else {
+      const data = await res.json();
+      alert(data.error || 'Erro ao deletar');
+      btn.disabled = false;
+    }
+  } catch (err) {
+    alert('Erro de conexão');
+    btn.disabled = false;
+  }
+}
+
+// ════════════════════════════════════════════════════
+//  AUTH
+// ════════════════════════════════════════════════════
+function logout() {
+  localStorage.removeItem('dvv_token');
+  localStorage.removeItem('dvv_user');
+  window.location.href = '/';
+}
+
+// ════════════════════════════════════════════════════
+//  HELPERS
+// ════════════════════════════════════════════════════
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>
