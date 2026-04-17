@@ -129,13 +129,16 @@ function currentMonthStart() {
 function createUser(email, passwordHash) {
   const id  = uuidv4();
   const now = Date.now();
+  // Se for o email do dono (ADMIN_EMAIL), vira elite automaticamente
+  const adminEmail = (process.env.ADMIN_EMAIL || '').toLowerCase().trim();
+  const plan = (adminEmail && email.toLowerCase().trim() === adminEmail) ? 'elite' : 'free';
 
   db.prepare(`
     INSERT INTO users (id, email, password_hash, plan, videos_this_month, month_reset, created_at)
-    VALUES (?, ?, ?, 'free', 0, ?, ?)
-  `).run(id, email.toLowerCase().trim(), passwordHash, currentMonthStart(), now);
+    VALUES (?, ?, ?, ?, 0, ?, ?)
+  `).run(id, email.toLowerCase().trim(), passwordHash, plan, currentMonthStart(), now);
 
-  return { id, email: email.toLowerCase().trim(), plan: 'free' };
+  return { id, email: email.toLowerCase().trim(), plan };
 }
 
 /**
