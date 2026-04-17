@@ -11,9 +11,13 @@ const path = require('path');
 
 class VideoComposer {
   constructor(options = {}) {
-    this.width = options.width || 1080;
-    this.height = options.height || 1920;
-    this.fps = options.fps || 30;
+    // Railway free tier tem ~512MB RAM — usa resolução menor para não explodir
+    const isLowMem = process.env.RAILWAY_ENVIRONMENT || process.env.LOW_MEMORY;
+    this.width  = options.width  || (isLowMem ? 720  : 1080);
+    this.height = options.height || (isLowMem ? 1280 : 1920);
+    this.fps    = options.fps    || (isLowMem ? 24   : 30);
+    // Limita threads do FFmpeg para não estourar RAM
+    this.ffmpegThreads = isLowMem ? '2' : '0';
     this.outputDir = options.outputDir || path.join(__dirname, '../output');
     this.tempDir = options.tempDir || path.join(__dirname, '../temp');
     this.ffmpegPath = this.findFFmpeg();
@@ -35,6 +39,11 @@ class VideoComposer {
     };
 
     this.ensureDirs();
+  }
+
+  // Flags padrão que vão em todo comando ffmpeg para limitar uso de memória
+  get ff() {
+    return [this.ffmpegPath, '-threads', this.ffmpegThreads];
   }
 
   ensureDirs() {
@@ -205,14 +214,14 @@ class VideoComposer {
     const kenBurns = kenBurnsPresets[slideIndex % kenBurnsPresets.length];
 
     const command = [
-      this.ffmpegPath,
+      ...this.ff,
       '-loop', '1',
       '-i', `"${imagePath}"`,
       '-vf', `"scale=${this.width * 2}:${this.height * 2}:force_original_aspect_ratio=increase,crop=${this.width * 2}:${this.height * 2},${kenBurns}"`,
       '-t', duration.toString(),
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       '-an',
       `"${outputPath}"`,
@@ -227,13 +236,13 @@ class VideoComposer {
    */
   async createVideoSlide(videoPath, outputPath, duration) {
     const command = [
-      this.ffmpegPath,
+      ...this.ff,
       '-i', `"${videoPath}"`,
       '-t', duration.toString(),
       '-vf', `"scale=${this.width}:${this.height}:force_original_aspect_ratio=increase,crop=${this.width}:${this.height}"`,
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       '-an',
       `"${outputPath}"`,
@@ -276,12 +285,12 @@ class VideoComposer {
 
     // Convert frames to video
     const command = [
-      this.ffmpegPath,
+      ...this.ff,
       '-framerate', this.fps.toString(),
       '-i', `"${path.join(framesDir, 'frame_%04d.jpg')}"`,
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       '-an',
       `"${outputPath}"`,
@@ -349,7 +358,7 @@ class VideoComposer {
    */
   async createBlackSlide(outputPath, duration) {
     const command = [
-      this.ffmpegPath,
+      ...this.ff,
       '-f', 'lavfi',
       '-i', `color=c=black:s=${this.width}x${this.height}:r=${this.fps}`,
       '-t', duration.toString(),
@@ -375,13 +384,13 @@ class VideoComposer {
     fs.writeFileSync(listPath, listContent);
 
     const command = [
-      this.ffmpegPath,
+      ...this.ff,
       '-f', 'concat',
       '-safe', '0',
       '-i', `"${listPath}"`,
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '22',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       `"${outputPath}"`,
       '-y',
@@ -399,12 +408,12 @@ class VideoComposer {
     const filter = this.DARK_FILTERS[style] || this.DARK_FILTERS.cinematic;
 
     const command = [
-      this.ffmpegPath,
+      ...this.ff,
       '-i', `"${inputPath}"`,
       '-vf', `"${filter}"`,
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '22',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       `"${outputPath}"`,
       '-y',
@@ -452,12 +461,12 @@ class VideoComposer {
 
     // Burn subtitles
     const command = [
-      this.ffmpegPath,
+      ...this.ff,
       '-i', `"${inputPath}"`,
       '-vf', `"ass='${assPath.replace(/\\/g, '/').replace(/:/g, '\\:')}'"`  ,
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '22',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       `"${outputPath}"`,
       '-y',
@@ -477,7 +486,7 @@ class VideoComposer {
    */
   async mixAudio(videoPath, narratorAudioPath, musicPath, musicVolume, outputPath) {
     let audioFilter = '';
-    let inputArgs = ['-i', `"${videoPath}"`];
+    let inputArgs = ['-i', `"${videoPath}"`]; // primeiro input — ffmpegPath fica no this.ff
 
     if (narratorAudioPath && fs.existsSync(narratorAudioPath)) {
       inputArgs.push('-i', `"${narratorAudioPath}"`);
@@ -501,8 +510,8 @@ class VideoComposer {
     }
 
     const command = [
-      this.ffmpegPath,
-      ...inputArgs,
+      ...this.ff,
+      ...inputArgs.slice(1), // já tem o ffmpegPath no this.ff
       audioFilter,
       '-c:v', 'copy',
       '-c:a', 'aac',
@@ -557,7 +566,7 @@ class VideoComposer {
 
     // Create video from frame
     const videoCommand = [
-      this.ffmpegPath,
+      ...this.ff,
       '-loop', '1',
       '-i', `"${framePath}"`,
       audioFile && fs.existsSync(audioFile) ? `-i "${audioFile}"` : '',
@@ -565,6 +574,7 @@ class VideoComposer {
       '-vf', `"scale=${this.width}:${this.height}"`,
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       audioFile && fs.existsSync(audioFile) ? '-c:a aac -shortest' : '-an',
       `"${outputPath}"`,
