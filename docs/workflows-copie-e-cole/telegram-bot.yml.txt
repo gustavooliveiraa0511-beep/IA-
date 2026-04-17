@@ -1,0 +1,48 @@
+name: 🤖 Bot Telegram (polling)
+
+# Roda o bot por até 5h por execução e se auto-reinicia a cada 5h.
+# GitHub Actions dá 2000 min/mês grátis = suficiente pra ~6h/dia.
+# Se precisar de 24/7 real, mover o bot pra Railway/Fly (free tier).
+
+on:
+  workflow_dispatch:
+  schedule:
+    # A cada 5 horas
+    - cron: "17 */5 * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  bot:
+    name: Rodar bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 300  # 5 horas
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-telegram-bot==21.6 httpx==0.27.2 python-dotenv==1.0.1 \
+                      pydantic==2.9.2 groq==0.11.0 rich==13.9.2 tenacity==9.0.0
+
+      - name: Rodar bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALLOWED_CHAT_ID: ${{ secrets.TELEGRAM_ALLOWED_CHAT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.BOT_GH_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          DEFAULT_TEMPLATE: motivacional
+          DEFAULT_VOICE: pt-BR-AntonioNeural
+          PYTHONPATH: .
+        run: |
+          python -m src.bot.telegram_bot
