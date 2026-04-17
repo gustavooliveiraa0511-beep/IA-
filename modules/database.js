@@ -18,7 +18,8 @@
 const Database = require('better-sqlite3');
 const fs       = require('fs');
 const path     = require('path');
-const { v4: uuidv4 } = require('uuid');
+// uuid v13+ é ESM-only — usa crypto nativo do Node.js
+const { randomUUID: uuidv4 } = require('crypto');
 
 // ---------------------------------------------------------------------------
 // Database bootstrap
