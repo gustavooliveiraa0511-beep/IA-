@@ -1,0 +1,170 @@
+"""
+Gera roteiro estruturado usando Groq (Llama 3.3 70B).
+
+O roteiro já vem com instruções de cena: qual imagem, quando
+usar fundo colorido, quando mostrar foto de pessoa, quais palavras
+destacar na legenda.
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from groq import Groq
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from src.pipeline.models import Script, ScriptLine, SceneType, TemplateType, VideoRequest
+from src.utils.config import config
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+TEMPLATE_INSTRUCTIONS = {
+    TemplateType.MOTIVACIONAL: """
+Estilo MOTIVACIONAL:
+- Hook de impacto nos primeiros 3 segundos (frase que pare o scroll)
+- Linguagem firme, direta, inspiradora
+- Use "você" (fala direto com o espectador)
+- Pelo menos 2 cenas de COLOR_BACKGROUND com frases de impacto curtas
+- Cenas de VIDEO_BROLL com pessoas em ação (correndo, vencendo, trabalhando)
+- Finalize com call-to-action ("siga pra mais", "salva esse vídeo", etc.)
+- Cores de fundo: preto (#000000), laranja-fogo (#ff4500), dourado (#daa520), vermelho (#b22222)
+""",
+    TemplateType.VIRAL: """
+Estilo VIRAL / CURIOSIDADES:
+- Hook com pergunta ou fato surpreendente
+- Ritmo acelerado, cenas curtas
+- Revele a informação por etapas (curiosity gap)
+- Mistura VIDEO_BROLL e IMAGE_KENBURNS
+- Final com gancho pra próximo vídeo
+""",
+    TemplateType.NOTICIAS: """
+Estilo NOTÍCIAS / INFORMATIVO:
+- Apresente o fato de forma clara nos primeiros segundos
+- Use PERSON_PHOTO quando citar pessoas públicas (defina person_name)
+- Ritmo médio, cenas de 2-3 segundos
+- Tom neutro e informativo
+""",
+    TemplateType.GAMING: """
+Estilo GAMING / ENTRETENIMENTO:
+- Energia alta, gírias jovens
+- Cenas curtíssimas (~1s)
+- Muita ênfase em palavras-chave
+- VIDEO_BROLL com gameplay ou cenas dinâmicas
+""",
+}
+
+
+SYSTEM_PROMPT = """Você é um roteirista especialista em vídeos curtos verticais (TikTok/Reels/Shorts) com alta retenção.
+
+REGRAS OBRIGATÓRIAS:
+1. O roteiro deve caber em {duration} segundos narrado em português do Brasil (ritmo ~160 palavras/minuto)
+2. Cada cena tem UMA frase curta (máximo 15 palavras por cena)
+3. Total de 6-10 cenas pra dar dinamismo
+4. Primeira cena SEMPRE é hook de impacto nos 3 primeiros segundos
+5. Use linguagem simples, direta, com emoção
+
+{template_instructions}
+
+Para cada cena escolha UM scene_type:
+- "video_broll": Cenas de ação, movimento, pessoas fazendo coisas. Use quando falar de ações.
+- "image_kenburns": Imagens estáticas que ganham movimento por zoom/pan. Use pra conceitos.
+- "color_background": Fundo liso colorido com a frase CENTRAL (frase de impacto isolada). Máximo 2x no vídeo.
+- "person_photo": Quando citar pessoa específica famosa. Defina person_name com o nome exato.
+
+Pra cada cena defina:
+- text: a frase (em português)
+- scene_type: um dos 4 acima
+- visual_query: termos em INGLÊS pra buscar no banco de vídeos (ex: "person running sunrise", "businessman success")
+- person_name: só se scene_type=person_photo
+- bg_color: só se scene_type=color_background. Hex. (#000000, #ff4500, #daa520, #b22222)
+- emphasis_words: 1-3 palavras MAIS IMPORTANTES da frase pra destacar na legenda
+
+RESPONDA APENAS em JSON válido com este formato exato:
+{{
+  "title": "título curto",
+  "hashtags": ["#motivacao", "#mindset", "..."],
+  "lines": [
+    {{
+      "text": "...",
+      "scene_type": "video_broll",
+      "visual_query": "...",
+      "person_name": null,
+      "bg_color": null,
+      "emphasis_words": ["palavra1", "palavra2"]
+    }}
+  ]
+}}
+"""
+
+
+class ScriptWriter:
+    def __init__(self) -> None:
+        if not config.groq_api_key:
+            raise ValueError("GROQ_API_KEY não configurado")
+        self.client = Groq(api_key=config.groq_api_key)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
+    def generate(self, request: VideoRequest) -> Script:
+        logger.info(f"Gerando roteiro: tema={request.theme!r} template={request.template}")
+
+        system = SYSTEM_PROMPT.format(
+            duration=request.duration_seconds,
+            template_instructions=TEMPLATE_INSTRUCTIONS[request.template],
+        )
+        user = f"Tema do vídeo: {request.theme}"
+        if request.custom_script:
+            user += f"\n\nTexto base do usuário (adapte em cenas):\n{request.custom_script}"
+
+        completion = self.client.chat.completions.create(
+            model=config.groq_model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.9,
+            max_tokens=2048,
+            response_format={"type": "json_object"},
+        )
+
+        raw = completion.choices[0].message.content or "{}"
+        logger.info(f"Resposta do Groq: {len(raw)} chars")
+
+        data = self._parse_json(raw)
+        script = self._to_script(data)
+        logger.info(f"Roteiro: {len(script.lines)} cenas | {len(script.full_text)} chars")
+        return script
+
+    @staticmethod
+    def _parse_json(raw: str) -> dict[str, Any]:
+        # Groq já responde JSON puro por causa do response_format
+        # Mas reforço a extração pra garantir
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+            raise
+
+    @staticmethod
+    def _to_script(data: dict[str, Any]) -> Script:
+        lines = []
+        for item in data.get("lines", []):
+            lines.append(
+                ScriptLine(
+                    text=item["text"],
+                    scene_type=SceneType(item["scene_type"]),
+                    visual_query=item.get("visual_query", ""),
+                    person_name=item.get("person_name"),
+                    bg_color=item.get("bg_color"),
+                    emphasis_words=item.get("emphasis_words", []),
+                )
+            )
+        return Script(
+            title=data.get("title", ""),
+            hashtags=data.get("hashtags", []),
+            lines=lines,
+        )
