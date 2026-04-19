@@ -291,11 +291,23 @@ class ScriptWriter:
             logger.info("[ScriptWriter] Modo PREMIUM: 3 rascunhos paralelos + seleção")
             script = self._premium_expand(expand_fn)
         else:
-            try:
-                script = expand_fn()
-            except Exception as e:
+            script = None
+            # Tenta 2 vezes antes de cair pro outline mecânico. A segunda
+            # tentativa costuma ser mais curta/certeira porque o LLM varia
+            # resposta entre calls.
+            for attempt in range(2):
+                try:
+                    script = expand_fn()
+                    break
+                except Exception as e:
+                    logger.warning(
+                        f"[ScriptWriter] Expand tentativa {attempt + 1} falhou "
+                        f"({type(e).__name__}): {e}"
+                    )
+            if script is None:
                 logger.warning(
-                    f"[ScriptWriter] Expand falhou ({type(e).__name__}), caindo pro outline mecânico: {e}"
+                    "[ScriptWriter] Todas as tentativas de expand falharam, "
+                    "caindo pro outline mecânico (roteiro básico, mas funcional)"
                 )
                 script = self._mechanical_from_outline(outline, request.template)
 
@@ -362,7 +374,7 @@ class ScriptWriter:
                 "Cada cena referencia a anterior com conector explícito. Responda só JSON."
             ),
             user=prompt,
-            max_tokens=4000,
+            max_tokens=8000,  # few-shot + visual_queries gera JSON longo; 8K é o teto do 2.5 flash
         )
         data = self._parse_json(raw)
         script = self._to_script(data, outline)
@@ -515,13 +527,47 @@ class ScriptWriter:
     # ============================================
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
+        """
+        Parser tolerante a JSON do LLM. Tenta em ordem:
+        1. Parse direto
+        2. Extrair bloco {...} com regex (descarta prosa antes/depois)
+        3. Se o JSON veio TRUNCADO (LLM bateu no limite de tokens),
+           tenta salvar o que der: fecha strings/arrays/objetos pendentes
+           e parseia o que deu. Pelo menos as primeiras N cenas são
+           recuperadas em vez de crashar tudo.
+        """
+        # Limpa cercas de código que alguns modelos insistem em mandar
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        # Tentativa 1: parse direto
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
+            pass
+
+        # Tentativa 2: pega o primeiro bloco {...} completo
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
                 return json.loads(match.group(0))
-            raise
+            except json.JSONDecodeError:
+                pass
+
+        # Tentativa 3: JSON truncado — fecha estruturas pendentes
+        recovered = _recover_truncated_json(raw)
+        if recovered is not None:
+            logger.warning(
+                "⚠️ JSON do LLM veio truncado. Recuperado parcialmente."
+            )
+            return recovered
+
+        raise json.JSONDecodeError(
+            f"Não foi possível parsear JSON do LLM. Primeiros 300 chars: {raw[:300]!r}",
+            raw, 0,
+        )
 
     @staticmethod
     def _to_script(data: dict[str, Any], outline_fallback: dict[str, Any]) -> Script:
@@ -583,3 +629,115 @@ class ScriptWriter:
             hashtags=[str(h) for h in hashtags if h],
             lines=lines,
         )
+
+
+# ============================================
+# Recuperação de JSON truncado pelo LLM
+# ============================================
+def _recover_truncated_json(raw: str) -> dict[str, Any] | None:
+    """
+    Quando o LLM bate no max_output_tokens e a resposta fica cortada no meio
+    de uma string/array/objeto, esta função tenta fechar as estruturas
+    pendentes e parsear o que deu.
+
+    Estratégia simples: fatia o texto em pontos "seguros" onde sabemos que
+    um objeto terminou (`},`) e tenta fechar cada nível em aberto.
+    """
+    # Pega só do primeiro { em diante
+    idx = raw.find("{")
+    if idx < 0:
+        return None
+    text = raw[idx:]
+
+    # Tenta várias estratégias, do mais agressivo ao mais conservador
+    candidates: list[str] = []
+
+    # Estratégia A: fatia no último `}` completo visto
+    last_obj_close = text.rfind("}")
+    if last_obj_close > 0:
+        candidates.append(text[: last_obj_close + 1])
+
+    # Estratégia B: vai removendo de trás pra frente até achar um ponto
+    # seguro e tenta fechar brackets/braces pendentes
+    for strategy_n in range(1, 5):
+        work = text
+        # Remove última string possivelmente incompleta: corta no último `"` que fecha par
+        # Forma bruta mas suficiente
+        # Remove qualquer vírgula pendente no fim
+        work = work.rstrip()
+        if work.endswith(","):
+            work = work[:-1]
+        # Remove qualquer key: "value incompleto (aspas abertas no fim)
+        # Conta aspas dentro pra descobrir se estamos dentro de string
+        in_str = False
+        escape = False
+        depth_brace = 0
+        depth_bracket = 0
+        last_safe = -1
+        for i, ch in enumerate(work):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth_brace += 1
+            elif ch == "}":
+                depth_brace -= 1
+                if depth_brace >= 0 and depth_bracket >= 0:
+                    last_safe = i + 1
+            elif ch == "[":
+                depth_bracket += 1
+            elif ch == "]":
+                depth_bracket -= 1
+        # Trunca até a última posição "fora de string"
+        if in_str and last_safe > 0:
+            work = work[:last_safe]
+        # Remove vírgula pendente
+        work = work.rstrip().rstrip(",")
+        # Fecha arrays e objetos pendentes
+        # Recalcula depth atual
+        in_str = False
+        escape = False
+        db = 0
+        dbr = 0
+        for ch in work:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                db += 1
+            elif ch == "}":
+                db -= 1
+            elif ch == "[":
+                dbr += 1
+            elif ch == "]":
+                dbr -= 1
+        # Fecha brackets primeiro (arrays), depois braces (objetos)
+        closing = ("]" * max(0, dbr)) + ("}" * max(0, db))
+        candidates.append(work + closing)
+        break  # uma estratégia basta
+
+    # Tenta parsear cada candidato
+    for c in candidates:
+        try:
+            data = json.loads(c)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
