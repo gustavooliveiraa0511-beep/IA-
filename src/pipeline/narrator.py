@@ -57,6 +57,105 @@ class Narrator:
     def __init__(self, voice: str = "pt-BR-AntonioNeural") -> None:
         self.voice = voice
 
+    def narrate_scenes(
+        self,
+        scene_texts: list[str],
+        output_path: Path,
+        rate: str = "+0%",
+        pitch: str = "+0Hz",
+        gap_seconds: float = 0.35,
+    ) -> Path:
+        """
+        Narra cada cena separadamente e concatena com silêncio entre elas.
+        Isso garante PAUSA NATURAL entre ideias (cria respiração).
+
+        gap_seconds: silêncio adicionado entre cenas (0.3-0.5s ideal).
+        """
+        logger.info(f"Narrando {len(scene_texts)} cenas separadamente (gap {gap_seconds}s)")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp_dir = output_path.parent / f".narr_parts_{output_path.stem}"
+        tmp_dir.mkdir(exist_ok=True)
+
+        part_files = []
+        try:
+            for i, scene_text in enumerate(scene_texts):
+                if not scene_text.strip():
+                    continue
+                part_path = tmp_dir / f"part_{i:03d}.mp3"
+                self.narrate(scene_text, part_path, rate=rate, pitch=pitch)
+                part_files.append(part_path)
+
+            if not part_files:
+                raise RuntimeError("Nenhuma cena narrada com sucesso")
+
+            # Concatena com silêncio entre as partes
+            self._concat_with_silence(part_files, output_path, gap_seconds)
+
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                raise RuntimeError("Concatenação da narração falhou")
+
+            logger.info(
+                f"✅ Narração completa: {output_path.stat().st_size / 1024:.1f} KB"
+            )
+            return output_path
+        finally:
+            # Limpa partes temporárias
+            for p in part_files:
+                p.unlink(missing_ok=True)
+            if tmp_dir.exists():
+                try:
+                    tmp_dir.rmdir()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _concat_with_silence(
+        parts: list[Path], output: Path, gap_seconds: float
+    ) -> None:
+        """Concatena arquivos MP3 inserindo silêncio de gap_seconds entre eles."""
+        # Gera arquivo de silêncio
+        silence = output.parent / f".silence_{gap_seconds}s.mp3"
+        if not silence.exists():
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi",
+                    "-i", f"anullsrc=channel_layout=mono:sample_rate=24000",
+                    "-t", f"{gap_seconds:.2f}",
+                    "-q:a", "9",
+                    "-acodec", "libmp3lame",
+                    str(silence),
+                ],
+                capture_output=True,
+                check=True,
+            )
+
+        # Monta lista pro concat demuxer intercalando parte + silêncio
+        list_file = output.parent / f".concat_{output.stem}.txt"
+        with open(list_file, "w") as f:
+            for i, part in enumerate(parts):
+                f.write(f"file '{part.resolve()}'\n")
+                # Silêncio entre cenas (não no final)
+                if i < len(parts) - 1:
+                    f.write(f"file '{silence.resolve()}'\n")
+
+        # Concat com re-encoding pra garantir compatibilidade
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", str(list_file),
+                "-c:a", "libmp3lame", "-b:a", "128k",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        list_file.unlink(missing_ok=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Concat áudio falhou: {result.stderr[-500:]}")
+
     def narrate(self, text: str, output_path: Path, rate: str = "+0%", pitch: str = "+0Hz") -> Path:
         """
         Gera narração com fallback em 3 níveis:

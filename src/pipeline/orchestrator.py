@@ -76,7 +76,7 @@ class PipelineOrchestrator:
             job.script = self.script_writer.generate(request)
 
             # ==========================================
-            # 2. NARRAÇÃO
+            # 2. NARRAÇÃO (cena por cena com pausa entre elas)
             # ==========================================
             job.status = "narrating"
             logger.info(f"[{job.job_id}] === NARRAÇÃO ===")
@@ -86,7 +86,22 @@ class PipelineOrchestrator:
             rate = RATE_BY_TEMPLATE.get(request.template.value, "+0%")
             narrator = Narrator(voice=voice)
             narration_path = work_dir / "narration.mp3"
-            narrator.narrate(job.script.full_text, narration_path, rate=rate)
+
+            # Gap entre cenas varia por template
+            gap = {
+                "motivacional": 0.45,  # pausa maior pra peso emocional
+                "viral": 0.20,          # pausa curta pra manter ritmo
+                "noticias": 0.35,
+                "gaming": 0.15,
+            }.get(request.template.value, 0.35)
+
+            scene_texts = [line.text for line in job.script.lines]
+            narrator.narrate_scenes(
+                scene_texts=scene_texts,
+                output_path=narration_path,
+                rate=rate,
+                gap_seconds=gap,
+            )
             job.narration_path = narration_path
 
             # ==========================================

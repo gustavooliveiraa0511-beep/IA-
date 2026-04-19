@@ -53,7 +53,20 @@ class Script(BaseModel):
 
     @property
     def full_text(self) -> str:
-        return " ".join(line.text for line in self.lines)
+        """
+        Junta todas as linhas garantindo pontuação no fim de cada cena.
+        Isso cria pausas naturais na narração (TTS respeita pontuação).
+        """
+        parts = []
+        for line in self.lines:
+            text = line.text.strip()
+            if not text:
+                continue
+            # Se a cena não termina em pontuação forte, adiciona ponto
+            if text[-1] not in ".!?":
+                text = text + "."
+            parts.append(text)
+        return " ".join(parts)
 
 
 class WordTimestamp(BaseModel):
