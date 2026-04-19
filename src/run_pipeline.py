@@ -35,6 +35,15 @@ def main() -> int:
     voice = os.getenv("VOICE", "pt-BR-AntonioNeural").strip()
     chat_id = os.getenv("CHAT_ID", "").strip() or config.telegram_allowed_chat_id
 
+    # Duração: clamp [10, 90] pra evitar valores extremos quebrando pipeline.
+    try:
+        duration_raw = int(os.getenv("VIDEO_DURATION_SECONDS") or config.video_duration_seconds)
+    except (TypeError, ValueError):
+        duration_raw = config.video_duration_seconds
+    duration = max(10, min(90, duration_raw))
+
+    quality_mode = os.getenv("SCRIPT_QUALITY_MODE", "standard").strip().lower()
+
     if not theme:
         logger.error("THEME não informado")
         return 2
@@ -47,10 +56,11 @@ def main() -> int:
 
     # Aviso inicial
     if chat_id:
+        quality_tag = " ✨ PREMIUM" if quality_mode == "premium" else ""
         send_text(
             chat_id,
             f"🎬 Iniciando geração: *{theme}*\n"
-            f"Template: `{template}` | Voz: `{voice}`",
+            f"Template: `{template}` | Voz: `{voice}` | {duration}s{quality_tag}",
         )
 
     # Checa configs obrigatórias
@@ -66,6 +76,7 @@ def main() -> int:
         theme=theme,
         template=template_enum,
         voice=voice,
+        duration_seconds=duration,
     )
 
     try:

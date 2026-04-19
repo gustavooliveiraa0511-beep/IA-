@@ -41,6 +41,7 @@ from src.pipeline.script_writer import ScriptWriter
 from src.pipeline.transcriber import Transcriber
 from src.utils.config import config, OUTPUT_DIR, TEMP_DIR, ensure_dirs
 from src.utils.logger import get_logger
+from src.utils.music import fetch_music
 
 logger = get_logger(__name__)
 
@@ -134,6 +135,7 @@ class PipelineOrchestrator:
             # ==========================================
             job.status = "fetching_media"
             logger.info(f"[{job.job_id}] === MÍDIA + PREPARO ===")
+            self.media.reset_used()  # diversidade por job (não reusar mídia entre cenas adjacentes)
             clip_paths: list[Path] = []
             for idx, scene in enumerate(job.scenes):
                 self._attach_media(scene)
@@ -162,16 +164,19 @@ class PipelineOrchestrator:
             caption_gen.generate(words, ass_path)
 
             # ==========================================
-            # 9. Assembly final (mixa áudio + queima legendas)
+            # 9. Assembly final (mixa áudio + queima legendas + ducking)
             # ==========================================
             logger.info(f"[{job.job_id}] === ASSEMBLY FINAL ===")
             final_path = OUTPUT_DIR / f"video_{job.job_id}.mp4"
+            # Música de fundo opcional por template — nil se usuário não
+            # configurou URLs em assets/music/tracks.json.
+            music_path = fetch_music(request.template.value)
             self.assembler.assemble(
                 video_path=concat_video,
                 narration_path=narration_path,
                 subtitle_ass_path=ass_path,
                 output_path=final_path,
-                music_path=None,  # PR 3: música de fundo
+                music_path=music_path,
                 sfx_events=None,
             )
             job.final_video_path = final_path
@@ -308,27 +313,28 @@ class PipelineOrchestrator:
         line = scene.script_line
         st = line.scene_type
 
-        # Queries: usa visual_queries se tiver, senão visual_query
+        # Queries: prefere a lista (alternativas), cai pro singular legado.
         queries = [q for q in (line.visual_queries or [line.visual_query]) if q]
-        primary_query = queries[0] if queries else "cinematic"
+        if not queries:
+            queries = ["cinematic"]
 
         if st == SceneType.VIDEO_BROLL:
-            path = self.media.fetch_video(primary_query)
+            path = self.media.fetch_video(queries)
             if not path:
                 # Fallback: imagem
-                path = self.media.fetch_image(primary_query or "abstract")
+                path = self.media.fetch_image(queries)
                 if path:
                     line.scene_type = SceneType.IMAGE_KENBURNS
             scene.media_path = path
 
         elif st == SceneType.IMAGE_KENBURNS:
-            scene.media_path = self.media.fetch_image(primary_query or "inspiration")
+            scene.media_path = self.media.fetch_image(queries)
 
         elif st == SceneType.PERSON_PHOTO:
             if line.person_name:
                 scene.media_path = self.media.fetch_person(line.person_name)
             if not scene.media_path:
-                scene.media_path = self.media.fetch_image(primary_query or "portrait")
+                scene.media_path = self.media.fetch_image(queries)
                 line.scene_type = SceneType.IMAGE_KENBURNS
 
         elif st == SceneType.COLOR_BACKGROUND:

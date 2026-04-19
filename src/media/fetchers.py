@@ -270,27 +270,80 @@ class WikipediaPhotoFetcher:
 # Dispatcher inteligente
 # ============================================
 class MediaDispatcher:
-    """Decide qual fetcher usar com fallback automático."""
+    """
+    Decide qual fetcher usar com fallback automático e evita repetir mídia
+    entre cenas consecutivas (diversidade visual).
+    """
 
     def __init__(self) -> None:
         self.pexels = PexelsFetcher() if config.pexels_api_key else None
         self.pixabay = PixabayFetcher() if config.pixabay_api_key else None
         self.wiki = WikipediaPhotoFetcher()
+        # Paths já usados neste job — evita reuso adjacente.
+        self._used_video_paths: set[str] = set()
+        self._used_image_paths: set[str] = set()
 
-    def fetch_video(self, query: str) -> Optional[Path]:
-        # Tenta Pexels primeiro (qualidade melhor), cai pra Pixabay
-        if self.pexels:
-            result = self.pexels.search_video(query)
-            if result:
-                return result
-        if self.pixabay:
-            return self.pixabay.search_video(query)
+    def reset_used(self) -> None:
+        """Reseta estado de diversidade (chamar no início de cada job)."""
+        self._used_video_paths.clear()
+        self._used_image_paths.clear()
+
+    def fetch_video(self, queries: str | list[str]) -> Optional[Path]:
+        """
+        Tenta cada query em ordem até achar vídeo. Primeira query deve ser a
+        mais genérica (mais resultados), últimas mais específicas.
+        Pexels primeiro (qualidade melhor), cai pra Pixabay.
+        """
+        for q in _as_list(queries):
+            if self.pexels:
+                result = self.pexels.search_video(q)
+                if result and self._is_fresh(result, self._used_video_paths):
+                    self._used_video_paths.add(str(result))
+                    return result
+            if self.pixabay:
+                result = self.pixabay.search_video(q)
+                if result and self._is_fresh(result, self._used_video_paths):
+                    self._used_video_paths.add(str(result))
+                    return result
+        # Se nenhuma query deu mídia fresca, aceita até repetida
+        for q in _as_list(queries):
+            if self.pexels:
+                r = self.pexels.search_video(q)
+                if r:
+                    return r
+            if self.pixabay:
+                r = self.pixabay.search_video(q)
+                if r:
+                    return r
         return None
 
-    def fetch_image(self, query: str) -> Optional[Path]:
-        if self.pixabay:
-            return self.pixabay.search_image(query)
+    def fetch_image(self, queries: str | list[str]) -> Optional[Path]:
+        if not self.pixabay:
+            return None
+        for q in _as_list(queries):
+            result = self.pixabay.search_image(q)
+            if result and self._is_fresh(result, self._used_image_paths):
+                self._used_image_paths.add(str(result))
+                return result
+        # Aceita repetida
+        for q in _as_list(queries):
+            r = self.pixabay.search_image(q)
+            if r:
+                return r
         return None
 
     def fetch_person(self, name: str) -> Optional[Path]:
         return self.wiki.fetch_person_photo(name)
+
+    @staticmethod
+    def _is_fresh(path: Path, used: set[str]) -> bool:
+        return str(path) not in used
+
+
+def _as_list(queries: str | list[str] | None) -> list[str]:
+    """Normaliza input em list[str], filtrando vazios."""
+    if not queries:
+        return []
+    if isinstance(queries, str):
+        return [queries] if queries.strip() else []
+    return [q for q in queries if q and q.strip()]

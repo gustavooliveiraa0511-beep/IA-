@@ -159,3 +159,10 @@ output/
 user_prefs.json
 media_cache/
 *.mp4.tmp
+
+# Modelos ML baixados on-demand (entram via actions/cache)
+assets/piper_models/
+# Música cacheada (só manifest + readme versionados)
+assets/music/*/
+!assets/music/README.md
+!assets/music/tracks.json

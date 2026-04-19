@@ -268,14 +268,21 @@ class ClipPreparer:
 # ============================================
 # PASSO 2: Concatena cenas com transições seletivas
 # ============================================
+XFADE_DURATION = 0.15  # segundos
+
+
 class SceneConcatenator:
     """
-    Junta as cenas preparadas.
+    Junta as cenas preparadas aplicando cross-fade (xfade) seletivo.
 
-    Regra de transições:
-    - Hard cut (corte seco) 80% das vezes — ritmo
-    - Cross-fade curto (0.2s) apenas quando scene_type muda de tipo
-      OU quando é uma cena de COLOR_BACKGROUND (virada de tópico)
+    Regra:
+    - Hard cut (corte seco) DEFAULT — mantém ritmo.
+    - Cross-fade 0.15s apenas quando cena seguinte é "virada":
+      * Muda de `scene_type` (ex: video_broll → color_background)
+      * OU é uma cena COLOR_BACKGROUND (virada de tópico/frase-chave)
+      * OU muda de `beat_type` (hook → development → climax → cta)
+
+    Fallback: se xfade falhar, cai pro concat demuxer (hard cuts em tudo).
     """
 
     def __init__(self, width: int = 1080, height: int = 1920, fps: int = 30) -> None:
@@ -285,23 +292,124 @@ class SceneConcatenator:
 
     def concat(self, clip_paths: list[Path], scenes: list[Scene], output: Path) -> Path:
         if len(clip_paths) == 1:
-            # Só copia
-            _run(["ffmpeg", "-y", "-i", str(clip_paths[0]), "-c", "copy", str(output)],
-                 "single clip copy")
+            _run(
+                ["ffmpeg", "-y", "-i", str(clip_paths[0]), "-c", "copy", str(output)],
+                "single clip copy",
+            )
             return output
 
-        # Monta filter_complex com xfade seletivo
-        filter_parts: list[str] = []
+        # Decide onde inserir xfade
+        transitions = self._decide_transitions(scenes)
+        xfade_count = sum(1 for t in transitions if t)
+        logger.info(
+            f"Concat: {len(clip_paths)} clipes, {xfade_count} xfades, "
+            f"{len(clip_paths) - 1 - xfade_count} hard cuts"
+        )
+
+        if xfade_count == 0:
+            # Sem transições suaves: demuxer simples (mais rápido)
+            return self._concat_demuxer(clip_paths, output)
+
+        try:
+            return self._concat_with_xfade(clip_paths, scenes, transitions, output)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Concat com xfade falhou ({type(e).__name__}): {e}. "
+                f"Caindo pro demuxer (hard cuts)."
+            )
+            return self._concat_demuxer(clip_paths, output)
+
+    @staticmethod
+    def _decide_transitions(scenes: list[Scene]) -> list[bool]:
+        """
+        Retorna lista com len = len(scenes)-1.
+        True em posição i = aplicar xfade entre scene[i] e scene[i+1].
+        """
+        if len(scenes) < 2:
+            return []
+
+        result: list[bool] = []
+        for i in range(len(scenes) - 1):
+            curr = scenes[i]
+            nxt = scenes[i + 1]
+            # Viradas de tipo
+            type_change = curr.script_line.scene_type != nxt.script_line.scene_type
+            # Virada narrativa (mudou o beat)
+            beat_change = curr.script_line.beat_type != nxt.script_line.beat_type
+            # Cena de frase-chave (fundo de cor)
+            is_pivot = (
+                nxt.script_line.scene_type.value == "color_background"
+                or curr.script_line.scene_type.value == "color_background"
+            )
+            result.append(type_change or beat_change or is_pivot)
+        return result
+
+    def _concat_with_xfade(
+        self,
+        clip_paths: list[Path],
+        scenes: list[Scene],
+        transitions: list[bool],
+        output: Path,
+    ) -> Path:
+        """
+        Concatena com xfade pontual via filter_complex.
+
+        Cada xfade encurta o vídeo final em `XFADE_DURATION` (overlap).
+        Calculamos offsets acumulados levando isso em conta.
+        """
         inputs_args: list[str] = []
         for p in clip_paths:
             inputs_args += ["-i", str(p)]
 
-        # Usa concat demuxer simples se não houver transição suave marcada
-        # Pra simplicidade e estabilidade, usamos concat demuxer (hard cut)
-        # e adicionamos transições pontuais via xfade quando necessário.
-        # Implementação inicial: só concat demuxer (hard cuts em todos).
-        # Transições xfade são adicionadas pelo FinalAssembler.
-        return self._concat_demuxer(clip_paths, output)
+        # Probe duração de cada clipe
+        durations = [_probe_duration(p) for p in clip_paths]
+
+        # Monta cadeia: [0:v] [1:v] xfade=offset=d0-0.15 → [v01]
+        #               [v01] [2:v] xfade=offset=d0+d1-2*0.15 → [v012]
+        # Pra hard cut: concat simples.
+        # Pra simplicidade e robustez, misturamos:
+        #   - Segmento contínuo de hard-cuts vira 1 concat com reencode
+        #   - Quando vier um xfade, usa xfade no concat anterior
+        # Mas isso é complexo. Abordagem mais simples e funcional: sempre
+        # usa filter_complex com concat filter (v=1:a=0) entre hard cuts e
+        # xfade nas viradas, mantendo offset acumulado.
+
+        filter_parts: list[str] = []
+        current_label = "0:v"
+        cumulative = durations[0]
+
+        for i in range(1, len(clip_paths)):
+            next_label = f"v{i}" if i < len(clip_paths) - 1 else "vout"
+            if transitions[i - 1]:
+                # xfade: offset = cumulative - XFADE_DURATION
+                offset = max(0.0, cumulative - XFADE_DURATION)
+                filter_parts.append(
+                    f"[{current_label}][{i}:v]xfade=transition=fade:"
+                    f"duration={XFADE_DURATION:.2f}:offset={offset:.3f}"
+                    f"[{next_label}]"
+                )
+                cumulative += durations[i] - XFADE_DURATION
+            else:
+                # Hard cut via concat filter
+                filter_parts.append(
+                    f"[{current_label}][{i}:v]concat=n=2:v=1:a=0[{next_label}]"
+                )
+                cumulative += durations[i]
+            current_label = next_label
+
+        filter_complex = ";".join(filter_parts)
+        cmd = [
+            "ffmpeg", "-y",
+            *inputs_args,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+            "-pix_fmt", "yuv420p",
+            "-r", str(self.fps),
+            str(output),
+        ]
+        _run(cmd, f"concat com {sum(transitions)} xfades")
+        return output
 
     def _concat_demuxer(self, clip_paths: list[Path], output: Path) -> Path:
         list_file = output.parent / "concat_list.txt"
@@ -316,8 +424,26 @@ class SceneConcatenator:
             "-r", str(self.fps),
             str(output),
         ]
-        _run(cmd, "concat scenes")
+        _run(cmd, "concat scenes (hard cuts)")
         return output
+
+
+def _probe_duration(path: Path) -> float:
+    """Duração total em segundos via ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.warning(f"ffprobe duração falhou em {path.name}: {e}")
+        return 3.0  # fallback razoável
 
 
 # ============================================
@@ -348,16 +474,41 @@ class FinalAssembler:
         input_idx = 2  # próximos índices pros inputs extras
 
         audio_filters: list[str] = []
-        audio_filters.append("[1:a]volume=1.0[narr]")
+        has_music = bool(music_path and music_path.exists())
+
+        if has_music:
+            # Narração é split em 2: uma pro mix, outra como sidechain do ducking
+            audio_filters.append("[1:a]volume=1.0,asplit=2[narr][narr_sc]")
+        else:
+            audio_filters.append("[1:a]volume=1.0[narr]")
 
         last_audio_label = "narr"
 
-        # Música de fundo (volume 0.12 — baixinha, não atrapalha narração)
-        if music_path and music_path.exists():
+        # Música de fundo com DUCKING automático (sidechaincompress):
+        # - bgm no volume base, looped infinito
+        # - sidechaincompress usa a narração como controle: quando há voz,
+        #   comprime a música; em silêncio, abre.
+        if has_music:
             inputs += ["-i", str(music_path)]
-            audio_filters.append(f"[{input_idx}:a]volume=0.12,aloop=loop=-1:size=2e+09[bgm]")
-            audio_filters.append(f"[{last_audio_label}][bgm]amix=inputs=2:duration=first:dropout_transition=2[mixed1]")
-            last_audio_label = "mixed1"
+            # aloop=loop=-1: loop infinito (caso música acabe antes do vídeo)
+            # aformat: normaliza sample rate e layout pra compatibilidade com sidechain
+            audio_filters.append(
+                f"[{input_idx}:a]aloop=loop=-1:size=2e+09,"
+                f"volume=0.28,"
+                f"aformat=sample_rates=44100:channel_layouts=stereo[bgm_raw]"
+            )
+            # Ducking: threshold=0.05 (-26dB approx), ratio=8, attack=5ms, release=400ms
+            audio_filters.append(
+                "[bgm_raw][narr_sc]sidechaincompress="
+                "threshold=0.05:ratio=8:attack=5:release=400:"
+                "makeup=1[bgm_ducked]"
+            )
+            # Mix narração + música ducked
+            audio_filters.append(
+                f"[{last_audio_label}][bgm_ducked]amix=inputs=2:"
+                f"duration=first:dropout_transition=0:normalize=0[mix1]"
+            )
+            last_audio_label = "mix1"
             input_idx += 1
 
         # SFX

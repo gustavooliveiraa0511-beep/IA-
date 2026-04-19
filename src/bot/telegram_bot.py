@@ -41,14 +41,26 @@ logger = get_logger(__name__)
 USER_PREFS_FILE = Path("user_prefs.json")
 
 
+DEFAULT_PREFS = {
+    "template": None,           # preenchido no _load_prefs via config
+    "voice": None,
+    "last_theme": None,
+    "quality_mode": "standard",  # ou "premium"
+    "duration": 45,              # segundos
+}
+
+
 def _load_prefs() -> dict:
-    if USER_PREFS_FILE.exists():
-        return json.loads(USER_PREFS_FILE.read_text())
-    return {
+    base = {
+        **DEFAULT_PREFS,
         "template": config.default_template,
         "voice": config.default_voice,
-        "last_theme": None,
+        "duration": config.video_duration_seconds,
     }
+    if USER_PREFS_FILE.exists():
+        saved = json.loads(USER_PREFS_FILE.read_text())
+        base.update(saved)
+    return base
 
 
 def _save_prefs(prefs: dict) -> None:
@@ -127,11 +139,17 @@ HELP_TEXT = """🎬 *Video Maker Bot* — comandos disponíveis:
 */voz* `<nome>` — muda a voz
  opções: antonio, francisca, thalita
 
+*/premium* — liga/desliga modo premium do roteiro
+ _3 rascunhos + seleção automática do mais coeso (leva +30s)_
+
+*/duracao* `<segundos>` — muda duração do vídeo
+ _10 a 90 segundos (default 45)_
+
 */roteiro* `<tema>` — só roteiro (aprova antes)
 
 */refazer* — refaz último tema com variação
 
-*/status* — mostra job atual
+*/status* — mostra config atual + último tema
 
 */ajuda* — esta mensagem
 """
@@ -206,6 +224,59 @@ async def cmd_voz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"✅ Voz agora é *{alias}*.", parse_mode="Markdown")
 
 
+async def cmd_premium(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Liga/desliga modo premium do roteiro (3 rascunhos paralelos + seleção)."""
+    if await _reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    prefs = _load_prefs()
+    new_mode = "standard" if prefs.get("quality_mode") == "premium" else "premium"
+    prefs["quality_mode"] = new_mode
+    _save_prefs(prefs)
+    if new_mode == "premium":
+        await update.message.reply_text(
+            "✨ *Modo PREMIUM ligado.*\n"
+            "Próximos roteiros vão usar 3 rascunhos paralelos + seleção.\n"
+            "Gera roteiro mais coeso, mas leva +30s e gasta mais do free tier.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "✅ Modo *standard* reativado.", parse_mode="Markdown"
+        )
+
+
+async def cmd_duracao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muda duração alvo do vídeo (segundos, 10-90)."""
+    if await _reject_if_unauthorized(update):
+        return
+    if not update.message:
+        return
+    if not context.args:
+        prefs = _load_prefs()
+        await update.message.reply_text(
+            f"⏱️ Duração atual: *{prefs.get('duration', 45)}s*\n"
+            f"Uso: /duracao <segundos>  (10 a 90)",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        seconds = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Duração inválida (use número inteiro).")
+        return
+    if not 10 <= seconds <= 90:
+        await update.message.reply_text("❌ Duração fora do intervalo 10-90s.")
+        return
+    prefs = _load_prefs()
+    prefs["duration"] = seconds
+    _save_prefs(prefs)
+    await update.message.reply_text(
+        f"✅ Duração agora é *{seconds}s*.", parse_mode="Markdown"
+    )
+
+
 async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _reject_if_unauthorized(update):
         return
@@ -226,16 +297,19 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "template": prefs["template"],
         "voice": prefs["voice"],
         "chat_id": chat_id,
+        "quality_mode": prefs.get("quality_mode", "standard"),
+        "duration": str(prefs.get("duration", 45)),
     }
 
     ok = await _dispatch_github_action(inputs)
     if ok:
+        quality_tag = " ✨ PREMIUM" if inputs["quality_mode"] == "premium" else ""
         await update.message.reply_text(
             f"🎬 Vídeo em produção!\n"
             f"Tema: *{theme}*\n"
-            f"Template: `{prefs['template']}`\n"
-            f"Voz: `{prefs['voice']}`\n\n"
-            f"Leva cerca de 2-5 min. Te mando quando ficar pronto 🚀",
+            f"Template: `{prefs['template']}` | Voz: `{prefs['voice']}`\n"
+            f"Duração: {inputs['duration']}s{quality_tag}\n\n"
+            f"Leva cerca de 3-7 min. Te mando quando ficar pronto 🚀",
             parse_mode="Markdown",
         )
     else:
@@ -265,10 +339,14 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     prefs = _load_prefs()
+    quality = prefs.get("quality_mode", "standard")
+    quality_label = "✨ premium" if quality == "premium" else "standard"
     await update.message.reply_text(
         f"📋 *Config atual:*\n"
         f"Template: `{prefs['template']}`\n"
         f"Voz: `{prefs['voice']}`\n"
+        f"Duração: `{prefs.get('duration', 45)}s`\n"
+        f"Qualidade: `{quality_label}`\n"
         f"Último tema: `{prefs.get('last_theme') or 'nenhum'}`\n\n"
         f"_Para status do job em execução, veja a aba 'Actions' do GitHub._",
         parse_mode="Markdown",
@@ -330,6 +408,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("refazer", cmd_refazer))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("roteiro", cmd_roteiro))
+    app.add_handler(CommandHandler("premium", cmd_premium))
+    app.add_handler(CommandHandler("duracao", cmd_duracao))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
 
