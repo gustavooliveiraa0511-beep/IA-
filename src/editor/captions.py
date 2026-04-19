@@ -1,16 +1,14 @@
 """
-Gerador de legendas ASS (Advanced SubStation Alpha) animadas
-estilo CapCut/Submagic.
+Gerador de legendas ASS animadas estilo CapCut/Submagic.
 
-O formato ASS permite:
-- Cor, sombra, borda grossa
-- Animações (\\t, \\fad, \\move, \\fscx, \\fscy)
-- Karaokê por palavra (\\k)
-- Palavra destacada aparecendo uma a uma
-- Efeito de brilho e glow
-
-Este módulo monta o arquivo .ass a partir dos timestamps do Whisper
-e das palavras de ênfase definidas no roteiro.
+Mudanças da reforma de qualidade:
+- `word.word` SEMPRE vem limpo (sem pontuação). A pontuação que veio anexada
+  está em `word.terminator` e é usada SÓ pra decidir quebra de janela.
+- Janelas não são mais fixas em N palavras: quebram automaticamente em fim de
+  frase (terminator contém `.`, `!`, `?`) ou ao atingir limite duro de 4.
+- Vírgula NÃO quebra janela (pausa fica a cargo da narração/pontuação).
+- Fade-in por evento (80ms) pra suavizar transição entre janelas.
+- Tracking (\\fsp) e ease-out no pop da palavra ativa.
 """
 from __future__ import annotations
 
@@ -32,24 +30,26 @@ class CaptionStyle:
     emphasis_color: str = "&H0000D7FF"     # laranja/dourado (destaque)
     outline_color: str = "&H00000000"      # preto (contorno)
     shadow_color: str = "&H80000000"       # preto semi-transparente
-    outline_width: int = 6                 # grossura do contorno
-    shadow_depth: int = 3                  # profundidade da sombra
-    margin_v: int = 450                    # distância do rodapé (pra aparecer no centro-baixo)
+    outline_width: int = 7                 # grossura do contorno (+1 pra contraste)
+    shadow_depth: int = 3
+    margin_v: int = 450                    # distância do rodapé (centro-baixo)
     bold: bool = True
     italic: bool = False
     scale_pop: int = 115                   # zoom ao aparecer (%)
-    pop_duration_ms: int = 120             # duração do zoom
-    add_glow: bool = True                  # brilho extra na ênfase
+    pop_duration_ms: int = 150             # duração do ease-out (zoom→100)
+    add_glow: bool = True
+    fade_in_ms: int = 80                   # fade-in leve entre janelas
+    max_words_per_window: int = 4          # limite duro (quebra em pontuação se antes)
 
 
 # Estilos pré-definidos por template
 STYLE_MOTIVACIONAL = CaptionStyle(
     font_name="Anton",
     font_size=96,
-    primary_color="&H00FFFFFF",       # branco
-    emphasis_color="&H0000D7FF",      # dourado (#FFD700 em BGR)
-    outline_color="&H00000000",       # preto
-    outline_width=7,
+    primary_color="&H00FFFFFF",
+    emphasis_color="&H0000D7FF",
+    outline_color="&H00000000",
+    outline_width=8,
     shadow_depth=4,
     scale_pop=120,
     add_glow=True,
@@ -59,10 +59,10 @@ STYLE_MOTIVACIONAL = CaptionStyle(
 STYLE_VIRAL = CaptionStyle(
     font_name="Anton",
     font_size=100,
-    primary_color="&H0000FFFF",       # amarelo
-    emphasis_color="&H000000FF",      # vermelho vibrante
+    primary_color="&H0000FFFF",
+    emphasis_color="&H000000FF",
     outline_color="&H00000000",
-    outline_width=8,
+    outline_width=9,
     shadow_depth=3,
     scale_pop=125,
     add_glow=True,
@@ -73,9 +73,9 @@ STYLE_NOTICIAS = CaptionStyle(
     font_name="Arial",
     font_size=78,
     primary_color="&H00FFFFFF",
-    emphasis_color="&H000000FF",      # vermelho sóbrio
+    emphasis_color="&H000000FF",
     outline_color="&H00000000",
-    outline_width=5,
+    outline_width=6,
     shadow_depth=2,
     scale_pop=108,
     add_glow=False,
@@ -86,10 +86,10 @@ STYLE_NOTICIAS = CaptionStyle(
 STYLE_GAMING = CaptionStyle(
     font_name="Anton",
     font_size=98,
-    primary_color="&H0000FFFF",       # amarelo
-    emphasis_color="&H00FF00FF",      # magenta
+    primary_color="&H0000FFFF",
+    emphasis_color="&H00FF00FF",
     outline_color="&H00000000",
-    outline_width=8,
+    outline_width=9,
     scale_pop=130,
     add_glow=True,
     margin_v=550,
@@ -102,6 +102,10 @@ STYLES_BY_TEMPLATE = {
     "noticias": STYLE_NOTICIAS,
     "gaming": STYLE_GAMING,
 }
+
+
+# Pontuação que QUEBRA janela (fim de frase)
+HARD_BREAK_PUNCTUATION = {".", "!", "?", "…"}
 
 
 def _seconds_to_ass_time(seconds: float) -> str:
@@ -120,22 +124,16 @@ class CaptionGenerator:
         style: CaptionStyle,
         video_width: int = 1080,
         video_height: int = 1920,
-        words_per_line: int = 3,
     ) -> None:
         self.style = style
         self.video_width = video_width
         self.video_height = video_height
-        # Quantas palavras aparecem simultaneamente na tela.
-        # Estilo CapCut moderno usa 2-4 palavras por vez.
-        self.words_per_line = words_per_line
 
     def generate(self, words: list[WordTimestamp], output_path: Path) -> Path:
         """Gera arquivo .ass e salva em output_path."""
         logger.info(f"Gerando legenda ASS para {len(words)} palavras")
-
         header = self._build_header()
         events = self._build_events(words)
-
         content = header + "\n" + events
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content, encoding="utf-8")
@@ -161,46 +159,67 @@ Style: Emphasis,{s.font_name},{int(s.font_size * 1.05)},{s.emphasis_color},{s.em
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"""
 
+    # ============================================
+    # Janelas: quebram em pontuação forte OU em limite de N palavras
+    # ============================================
+    def _build_windows(self, words: list[WordTimestamp]) -> list[tuple[int, int]]:
+        """
+        Retorna lista de (start_idx, end_idx_exclusive) definindo cada janela.
+
+        Regras:
+        - Quebra quando a palavra corrente termina em `.!?…` (fim de frase).
+        - Quebra quando atingir `max_words_per_window` (limite duro).
+        - Vírgulas/dois-pontos NÃO quebram (pausa vem da narração).
+        """
+        windows: list[tuple[int, int]] = []
+        if not words:
+            return windows
+
+        start = 0
+        for i, w in enumerate(words):
+            count_in_window = i - start + 1
+            hits_limit = count_in_window >= self.style.max_words_per_window
+            ends_sentence = bool(w.terminator) and any(
+                c in HARD_BREAK_PUNCTUATION for c in w.terminator
+            )
+            if hits_limit or ends_sentence:
+                windows.append((start, i + 1))
+                start = i + 1
+
+        if start < len(words):
+            windows.append((start, len(words)))
+        return windows
+
     def _build_events(self, words: list[WordTimestamp]) -> str:
         """
-        Agrupa palavras em janelas de N palavras (words_per_line) e
-        dentro de cada janela anima cada palavra aparecendo com pop
-        e destacando a palavra 'atual'.
+        Um evento ASS por PALAVRA. A janela inteira fica na tela enquanto
+        a palavra ativa (atual) é animada com pop + cor de ênfase.
 
-        Cria um evento por palavra: a janela atualiza palavra por
-        palavra (estilo CapCut moderno).
+        Fim de frase (.!?) quebra janela antes do limite de 4 palavras.
         """
+        windows = self._build_windows(words)
+        logger.info(f"Captions: {len(windows)} janelas pra {len(words)} palavras")
         lines: list[str] = []
-        n = len(words)
         s = self.style
 
-        for i in range(n):
-            # Janela: palavras [start..end)
-            window_start = (i // self.words_per_line) * self.words_per_line
-            window_end = min(window_start + self.words_per_line, n)
-            window_words = words[window_start:window_end]
+        for w_start, w_end in windows:
+            window_words = words[w_start:w_end]
 
-            # Palavra "ativa" (sendo falada) dentro da janela
-            active_index_in_window = i - window_start
+            for rel_idx, word in enumerate(window_words):
+                abs_idx = w_start + rel_idx
+                # Timing: evento dura enquanto a palavra é falada; fecha no
+                # início da próxima palavra pra não sobrepor janelas.
+                start_t = word.start
+                if abs_idx + 1 < len(words):
+                    end_t = max(words[abs_idx + 1].start, start_t + 0.05)
+                else:
+                    end_t = word.end + 0.3
 
-            # Timing: esta linha aparece enquanto a palavra ativa é falada.
-            # Fecha exatamente no start da próxima palavra pra evitar overlap
-            # e flicker de 2 eventos ASS renderizados ao mesmo tempo.
-            start_t = words[i].start
-            if i + 1 < n:
-                end_t = max(words[i + 1].start, start_t + 0.05)
-            else:
-                end_t = words[i].end + 0.3
-
-            text = self._render_window(
-                window_words,
-                active_index_in_window,
-            )
-
-            lines.append(
-                f"Dialogue: 0,{_seconds_to_ass_time(start_t)},"
-                f"{_seconds_to_ass_time(end_t)},Default,,0,0,0,,{text}"
-            )
+                text = self._render_window(window_words, rel_idx)
+                lines.append(
+                    f"Dialogue: 0,{_seconds_to_ass_time(start_t)},"
+                    f"{_seconds_to_ass_time(end_t)},Default,,0,0,0,,{text}"
+                )
 
         return "\n".join(lines)
 
@@ -212,12 +231,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
         """
         Monta a linha de legenda com a palavra ativa destacada.
 
-        A palavra ativa recebe:
-        - cor de destaque
-        - zoom (pop) no momento de aparecer
-        - glow opcional
+        Animação da palavra ativa:
+        - Fade-in leve da linha inteira (\\fad no início do token)
+        - Scale-pop com ease-out (\\t(0,pop_ms,\\fscx100\\fscy100))
+        - Cor de ênfase
+        - Glow opcional (\\blur)
+        - Tracking aumentado (\\fsp) pra presença
+
+        Palavras não-ativas ficam na cor primária sem animação.
         """
         s = self.style
+        fade_prefix = f"{{\\fad({s.fade_in_ms},0)}}" if s.fade_in_ms > 0 else ""
         parts: list[str] = []
 
         for idx, word in enumerate(window_words):
@@ -226,31 +250,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
                 continue
 
             if idx == active_index:
-                # Palavra ativa: cor de destaque + pop in
-                # \t(0,pop_ms,\fscx\fscy=100) faz o zoom decrescer
-                pop_tag = (
+                # Palavra ativa: pop + cor + glow
+                tags = (
                     f"{{\\fscx{s.scale_pop}\\fscy{s.scale_pop}"
                     f"\\t(0,{s.pop_duration_ms},\\fscx100\\fscy100)"
                     f"\\c{s.emphasis_color}"
                     f"\\3c{s.outline_color}"
+                    f"\\fsp2"
                 )
                 if s.add_glow:
-                    # Glow via blur (\blur)
-                    pop_tag += "\\blur0.8"
-                # Palavra de ênfase marcada pelo roteiro ganha bold extra
+                    tags += "\\blur0.8"
                 if word.is_emphasis:
-                    pop_tag += "\\b1\\fs" + str(int(s.font_size * 1.15))
-                pop_tag += "}"
-                parts.append(f"{pop_tag}{text}{{\\r}}")
+                    # Palavra marcada como ênfase no roteiro: bold + fonte maior
+                    tags += "\\b1\\fs" + str(int(s.font_size * 1.15))
+                tags += "}"
+                parts.append(f"{tags}{text}{{\\r}}")
             else:
-                # Palavras passadas/futuras ficam em cor primária
-                # Se for palavra já falada (antes da ativa), fica mais opaca
+                # Palavras da janela que não são ativas: cor primária
                 parts.append(text)
 
-        return " ".join(parts)
+        return fade_prefix + " ".join(parts)
 
 
 def build_caption_generator(template: str, **kwargs) -> CaptionGenerator:
     """Factory: retorna CaptionGenerator com o estilo do template."""
     style = STYLES_BY_TEMPLATE.get(template, STYLE_MOTIVACIONAL)
+    # Aceita apenas video_width e video_height (words_per_line foi removido)
+    kwargs = {k: v for k, v in kwargs.items() if k in {"video_width", "video_height"}}
     return CaptionGenerator(style=style, **kwargs)

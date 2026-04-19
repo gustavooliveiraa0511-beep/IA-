@@ -35,14 +35,30 @@ class VideoRequest(BaseModel):
     custom_script: Optional[str] = None  # se o usuário quiser mandar o próprio texto
 
 
+class BeatType(str, Enum):
+    """
+    Papel narrativo da cena. Afeta a velocidade de narração:
+    - hook: abertura que prende (ritmo firme, levemente mais rápido)
+    - development: argumento principal (ritmo neutro)
+    - climax: virada / frase-chave (ritmo MAIS lento, dramático)
+    - cta: call-to-action / fechamento (ritmo firme, autoritário)
+    """
+    HOOK = "hook"
+    DEVELOPMENT = "development"
+    CLIMAX = "climax"
+    CTA = "cta"
+
+
 class ScriptLine(BaseModel):
     """Uma frase do roteiro com instruções de cena."""
     text: str
     scene_type: SceneType
-    visual_query: str = ""  # termo de busca no Pexels/Pixabay
+    visual_query: str = ""  # termo de busca no Pexels/Pixabay (primeira query)
+    visual_queries: list[str] = Field(default_factory=list)  # alternativas (até 3) pra fetchers tentarem até achar b-roll bom
     person_name: Optional[str] = None  # se scene_type == PERSON_PHOTO
     bg_color: Optional[str] = None  # hex se scene_type == COLOR_BACKGROUND
     emphasis_words: list[str] = Field(default_factory=list)  # palavras pra destacar
+    beat_type: BeatType = BeatType.DEVELOPMENT  # papel narrativo (afeta ritmo da narração)
 
 
 class Script(BaseModel):
@@ -70,11 +86,20 @@ class Script(BaseModel):
 
 
 class WordTimestamp(BaseModel):
-    """Timestamp de uma palavra (saída do Whisper)."""
+    """
+    Timestamp de uma palavra.
+
+    Fonte primária: stream WordBoundary do Edge TTS (tempo exato, sem pontuação).
+    Fonte fallback: faster-whisper (quando TTS cai pro Piper/gTTS).
+
+    ⚠️ `word` é SEMPRE a palavra LIMPA (sem pontuação). A pontuação que vinha
+    anexada fica em `terminator` e é usada pra decidir quebra de legenda.
+    """
     word: str
     start: float  # segundos
     end: float
     is_emphasis: bool = False
+    terminator: str = ""  # pontuação que terminava a palavra: "", ".", ",", "!", "?", "...", ";", ":"
 
 
 class Scene(BaseModel):

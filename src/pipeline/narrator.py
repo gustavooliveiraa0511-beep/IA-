@@ -1,29 +1,40 @@
 """
-Narração com sistema de fallback em cascata de 3 níveis.
+Narração com fluxo prosódico natural.
 
-1. Edge TTS (Microsoft) — vozes brasileiras nomeadas, qualidade TOP
-2. Piper TTS — neural LOCAL, sem dependência de internet, qualidade boa
-3. gTTS (Google) — robótica, mas SEMPRE funciona (último recurso)
+Filosofia (depois da reforma de qualidade):
+- A PONTUAÇÃO do roteiro é o instrumento primário de ritmo. Edge TTS interpreta
+  pontos, vírgulas, reticências e pontos-de-exclamação muito bem — criando
+  respiração natural sem precisar de silêncios artificiais.
+- NÃO narramos cena-por-cena com gap fixo (isso quebrava o fluxo argumentativo).
+- Narramos o ROTEIRO INTEIRO como um texto só, mas variamos o `rate` por trecho
+  de mesmo `beat_type` (hook/development/climax/cta). Assim o climax fica mais
+  lento e dramático sem perder continuidade.
+- Extraímos WORD BOUNDARIES direto do stream do Edge TTS (timestamps exatos
+  de cada palavra) — fonte primária pra legendas e alinhamento de cenas.
+
+Cascata de fallback (na ordem):
+1. Edge TTS (Microsoft) — qualidade alta + WordBoundary exato
+2. Piper TTS — neural local, grátis, sem WordBoundary (cai pro Whisper)
+3. gTTS (Google) — último recurso, sem WordBoundary
 
 Vozes Edge TTS PT-BR:
-- pt-BR-AntonioNeural  (masculina, firme — motivacional)
-- pt-BR-FranciscaNeural (feminina, clara — notícias)
-- pt-BR-ThalitaNeural  (feminina, jovem — viral)
-
-Piper voice: pt_BR-faber-medium (masculina neural, ~63MB)
+- pt-BR-AntonioNeural    (masculina, firme — motivacional)
+- pt-BR-FranciscaNeural  (feminina, clara — notícias)
+- pt-BR-ThalitaNeural    (feminina, jovem — viral)
 """
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
 import subprocess
-import os
 from pathlib import Path
+from typing import Optional
 
 import edge_tts
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from src.pipeline.models import BeatType, Script, ScriptLine, WordTimestamp
 from src.utils.config import ASSETS_DIR
 from src.utils.logger import get_logger
 
@@ -42,6 +53,46 @@ PIPER_CONFIG_URL = (
 )
 
 
+# ============================================
+# Rate (velocidade) por papel narrativo (beat_type)
+# O Edge TTS aceita "+X%"/"-X%". Valores negativos = mais devagar.
+# ============================================
+RATE_BY_BEAT: dict[BeatType, str] = {
+    BeatType.HOOK: "-3%",          # firme mas levemente mais rápido
+    BeatType.DEVELOPMENT: "+0%",   # neutro
+    BeatType.CLIMAX: "-8%",        # dramático, respirando
+    BeatType.CTA: "-5%",           # autoritário
+}
+
+
+# Ajuste extra de velocidade por template (multiplica/soma com o rate de beat)
+# Mantido pra permitir tom diferente entre motivacional e gaming sem mudar beat.
+RATE_BY_TEMPLATE: dict[str, int] = {
+    "motivacional": -2,   # levemente mais lento (dá peso)
+    "viral": +8,          # mais energia
+    "noticias": 0,        # neutro
+    "gaming": +12,        # alta energia
+}
+
+
+def _combine_rate(beat: BeatType, template: str) -> str:
+    """Soma o rate do beat com ajuste do template. Retorna '+X%' ou '-X%'."""
+    base = int(RATE_BY_BEAT[beat].rstrip("%"))
+    bonus = RATE_BY_TEMPLATE.get(template, 0)
+    total = base + bonus
+    sign = "+" if total >= 0 else ""
+    return f"{sign}{total}%"
+
+
+# Vozes recomendadas por template
+VOICE_BY_TEMPLATE: dict[str, str] = {
+    "motivacional": "pt-BR-AntonioNeural",
+    "viral": "pt-BR-ThalitaNeural",
+    "noticias": "pt-BR-FranciscaNeural",
+    "gaming": "pt-BR-AntonioNeural",
+}
+
+
 def _run_async_safely(coro):
     """Roda coroutine em qualquer contexto (sync ou async)."""
     try:
@@ -53,55 +104,118 @@ def _run_async_safely(coro):
         return asyncio.run(coro)
 
 
+# ============================================
+# Narrator
+# ============================================
 class Narrator:
     def __init__(self, voice: str = "pt-BR-AntonioNeural") -> None:
         self.voice = voice
 
-    def narrate_scenes(
+    # ============================================
+    # API principal: narra o roteiro todo e retorna timestamps (WordBoundary)
+    # ============================================
+    def narrate_script(
         self,
-        scene_texts: list[str],
+        script: Script,
         output_path: Path,
-        rate: str = "+0%",
-        pitch: str = "+0Hz",
-        gap_seconds: float = 0.35,
-    ) -> Path:
+        template: str = "motivacional",
+    ) -> tuple[Path, list[WordTimestamp]]:
         """
-        Narra cada cena separadamente e concatena com silêncio entre elas.
-        Isso garante PAUSA NATURAL entre ideias (cria respiração).
+        Narra o roteiro completo variando a velocidade por `beat_type`.
 
-        gap_seconds: silêncio adicionado entre cenas (0.3-0.5s ideal).
+        Retorna (caminho_mp3, lista_de_WordTimestamp).
+        Se Edge TTS funcionar, a lista vem com timestamps EXATOS do TTS
+        (sem precisar rodar Whisper). Caso contrário, retorna lista vazia
+        e o orchestrator chama Whisper como fallback.
         """
-        logger.info(f"Narrando {len(scene_texts)} cenas separadamente (gap {gap_seconds}s)")
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not script.lines:
+            raise RuntimeError("Script vazio — nada pra narrar")
 
-        tmp_dir = output_path.parent / f".narr_parts_{output_path.stem}"
+        # Agrupa linhas consecutivas com mesmo beat_type (cada grupo = 1 chamada TTS)
+        groups = self._group_by_beat(script.lines)
+        logger.info(
+            f"[Narrator] Narrando {len(script.lines)} cenas em "
+            f"{len(groups)} grupos de beat: {[g[0].value for g in groups]}"
+        )
+
+        tmp_dir = output_path.parent / f".narr_{output_path.stem}"
         tmp_dir.mkdir(exist_ok=True)
 
-        part_files = []
+        parts: list[Path] = []
+        all_words: list[WordTimestamp] = []
+        cumulative_offset = 0.0
+        any_edge_success = False
+
         try:
-            for i, scene_text in enumerate(scene_texts):
-                if not scene_text.strip():
-                    continue
-                part_path = tmp_dir / f"part_{i:03d}.mp3"
-                self.narrate(scene_text, part_path, rate=rate, pitch=pitch)
-                part_files.append(part_path)
+            for g_idx, (beat, lines) in enumerate(groups):
+                text = self._group_text(lines)
+                part_path = tmp_dir / f"grp_{g_idx:02d}.mp3"
+                rate = _combine_rate(beat, template)
 
-            if not part_files:
-                raise RuntimeError("Nenhuma cena narrada com sucesso")
+                # Tenta Edge TTS com WordBoundary
+                words_in_part: list[WordTimestamp] = []
+                edge_ok = False
+                try:
+                    words_in_part = self._edge_narrate_with_boundaries(
+                        text, part_path, rate=rate
+                    )
+                    edge_ok = True
+                    any_edge_success = True
+                    logger.info(
+                        f"[Narrator] grp {g_idx} ({beat.value}, {rate}): Edge ✅ "
+                        f"{len(words_in_part)} palavras"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[Narrator] Edge falhou no grp {g_idx}: {type(e).__name__}: {e}"
+                    )
 
-            # Concatena com silêncio entre as partes
-            self._concat_with_silence(part_files, output_path, gap_seconds)
+                # Fallback pra Piper / gTTS (sem WordBoundary — Whisper depois)
+                if not edge_ok:
+                    try:
+                        self._piper_narrate(text, part_path)
+                        logger.info(f"[Narrator] grp {g_idx}: Piper ✅ (sem boundaries)")
+                    except Exception as e:
+                        logger.warning(
+                            f"[Narrator] Piper falhou no grp {g_idx}: {type(e).__name__}"
+                        )
+                        self._gtts_narrate(text, part_path)
+                        logger.info(f"[Narrator] grp {g_idx}: gTTS ✅ (último recurso)")
 
-            if not output_path.exists() or output_path.stat().st_size == 0:
-                raise RuntimeError("Concatenação da narração falhou")
+                parts.append(part_path)
+
+                # Ajusta offsets das words desse grupo pro tempo acumulado
+                for w in words_in_part:
+                    all_words.append(
+                        WordTimestamp(
+                            word=w.word,
+                            start=w.start + cumulative_offset,
+                            end=w.end + cumulative_offset,
+                            terminator=w.terminator,
+                        )
+                    )
+
+                # Descobre duração real do mp3 pra atualizar o offset
+                part_duration = _probe_duration(part_path)
+                cumulative_offset += part_duration
+
+            # Concatena os mp3s em um único arquivo (sem gap entre grupos — fluxo contínuo)
+            self._concat(parts, output_path)
 
             logger.info(
-                f"✅ Narração completa: {output_path.stat().st_size / 1024:.1f} KB"
+                f"[Narrator] ✅ Narração total: {cumulative_offset:.2f}s "
+                f"({output_path.stat().st_size / 1024:.1f} KB), "
+                f"{len(all_words)} words com timestamps "
+                f"(Edge={'✅' if any_edge_success else '❌'})"
             )
-            return output_path
+
+            # Se todos os grupos caíram pro Piper/gTTS, retorna words vazio
+            # (orchestrator vai chamar Whisper).
+            return output_path, (all_words if any_edge_success else [])
         finally:
-            # Limpa partes temporárias
-            for p in part_files:
+            # Limpa temporários
+            for p in parts:
                 p.unlink(missing_ok=True)
             if tmp_dir.exists():
                 try:
@@ -109,136 +223,108 @@ class Narrator:
                 except OSError:
                     pass
 
+    # ============================================
+    # Agrupa cenas consecutivas com o mesmo beat_type
+    # ============================================
     @staticmethod
-    def _concat_with_silence(
-        parts: list[Path], output: Path, gap_seconds: float
-    ) -> None:
-        """Concatena arquivos MP3 inserindo silêncio de gap_seconds entre eles."""
-        # Gera arquivo de silêncio
-        silence = output.parent / f".silence_{gap_seconds}s.mp3"
-        if not silence.exists():
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-f", "lavfi",
-                    "-i", f"anullsrc=channel_layout=mono:sample_rate=24000",
-                    "-t", f"{gap_seconds:.2f}",
-                    "-q:a", "9",
-                    "-acodec", "libmp3lame",
-                    str(silence),
-                ],
-                capture_output=True,
-                check=True,
-            )
+    def _group_by_beat(
+        lines: list[ScriptLine],
+    ) -> list[tuple[BeatType, list[ScriptLine]]]:
+        groups: list[tuple[BeatType, list[ScriptLine]]] = []
+        current_beat: Optional[BeatType] = None
+        current_lines: list[ScriptLine] = []
+        for line in lines:
+            if line.beat_type != current_beat:
+                if current_lines:
+                    groups.append((current_beat, current_lines))  # type: ignore
+                current_beat = line.beat_type
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+        if current_lines:
+            groups.append((current_beat, current_lines))  # type: ignore
+        return groups
 
-        # Monta lista pro concat demuxer intercalando parte + silêncio
-        list_file = output.parent / f".concat_{output.stem}.txt"
-        with open(list_file, "w") as f:
-            for i, part in enumerate(parts):
-                f.write(f"file '{part.resolve()}'\n")
-                # Silêncio entre cenas (não no final)
-                if i < len(parts) - 1:
-                    f.write(f"file '{silence.resolve()}'\n")
-
-        # Concat com re-encoding pra garantir compatibilidade
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(list_file),
-                "-c:a", "libmp3lame", "-b:a", "128k",
-                str(output),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        list_file.unlink(missing_ok=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Concat áudio falhou: {result.stderr[-500:]}")
-
-    def narrate(self, text: str, output_path: Path, rate: str = "+0%", pitch: str = "+0Hz") -> Path:
-        """
-        Gera narração com fallback em 3 níveis:
-        Edge TTS → Piper TTS (local neural) → gTTS (robótica mas ok).
-        """
-        logger.info(f"Narrando {len(text)} chars (voz {self.voice})")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # === NÍVEL 1: Edge TTS ===
-        try:
-            self._narrate_edge(text, output_path, rate, pitch)
-            if output_path.exists() and output_path.stat().st_size > 1000:
-                logger.info(
-                    f"✅ Edge TTS ok ({output_path.stat().st_size / 1024:.1f} KB)"
-                )
-                return output_path
-        except Exception as e:
-            logger.warning(f"⚠️ Edge TTS falhou: {type(e).__name__}: {e}")
-            logger.warning("Tentando Piper TTS (neural local)...")
-
-        # === NÍVEL 2: Piper TTS (neural local) ===
-        try:
-            self._narrate_piper(text, output_path)
-            if output_path.exists() and output_path.stat().st_size > 1000:
-                logger.info(
-                    f"✅ Piper TTS ok ({output_path.stat().st_size / 1024:.1f} KB)"
-                )
-                return output_path
-        except Exception as e:
-            logger.warning(f"⚠️ Piper TTS falhou: {type(e).__name__}: {e}")
-            logger.warning("Caindo pro gTTS (último recurso)...")
-
-        # === NÍVEL 3: gTTS (último recurso) ===
-        try:
-            self._narrate_gtts(text, output_path)
-            if output_path.exists() and output_path.stat().st_size > 1000:
-                logger.info(
-                    f"✅ gTTS ok ({output_path.stat().st_size / 1024:.1f} KB)"
-                )
-                return output_path
-        except Exception as e:
-            logger.error(f"❌ gTTS também falhou: {type(e).__name__}: {e}")
-            raise RuntimeError(
-                f"Nenhum TTS funcionou. Último erro: {e}"
-            ) from e
-
-        raise RuntimeError("TTS não gerou áudio válido (arquivo vazio)")
+    @staticmethod
+    def _group_text(lines: list[ScriptLine]) -> str:
+        """Junta o texto das linhas do grupo garantindo pontuação final."""
+        parts: list[str] = []
+        for line in lines:
+            t = line.text.strip()
+            if not t:
+                continue
+            if t[-1] not in ".!?…":
+                t += "."
+            parts.append(t)
+        return " ".join(parts)
 
     # ============================================
-    # NÍVEL 1: Edge TTS
+    # Edge TTS com stream WordBoundary
     # ============================================
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=6), reraise=True)
-    def _narrate_edge(self, text: str, output_path: Path, rate: str, pitch: str) -> None:
-        _run_async_safely(self._generate_async_edge(text, output_path, rate, pitch))
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise RuntimeError("Edge TTS não produziu áudio")
+    def _edge_narrate_with_boundaries(
+        self, text: str, output_path: Path, rate: str = "+0%"
+    ) -> list[WordTimestamp]:
+        """
+        Gera áudio via Edge TTS e coleta eventos WordBoundary do stream.
 
-    async def _generate_async_edge(
-        self, text: str, output_path: Path, rate: str, pitch: str
-    ) -> None:
-        communicate = edge_tts.Communicate(
-            text,
-            voice=self.voice,
-            rate=rate,
-            pitch=pitch,
+        WordBoundary vem com:
+        - offset: em "100ns ticks" (dividir por 10_000_000 pra segundos)
+        - duration: idem
+        - text: palavra sem pontuação
+
+        Retorna lista de WordTimestamp com `terminator=""` (Edge não anexa
+        pontuação no text do evento).
+        """
+        audio_chunks, words = _run_async_safely(
+            self._edge_stream_async(text, rate)
         )
-        await communicate.save(str(output_path))
+        if not audio_chunks:
+            raise RuntimeError("Edge TTS não retornou áudio")
+
+        # Salva MP3
+        with open(output_path, "wb") as f:
+            for chunk in audio_chunks:
+                f.write(chunk)
+
+        if output_path.stat().st_size < 1000:
+            raise RuntimeError(f"Edge TTS gerou áudio muito pequeno ({output_path.stat().st_size}B)")
+        return words
+
+    async def _edge_stream_async(
+        self, text: str, rate: str
+    ) -> tuple[list[bytes], list[WordTimestamp]]:
+        communicate = edge_tts.Communicate(text=text, voice=self.voice, rate=rate)
+        audio_chunks: list[bytes] = []
+        words: list[WordTimestamp] = []
+        async for chunk in communicate.stream():
+            ctype = chunk.get("type")
+            if ctype == "audio":
+                audio_chunks.append(chunk["data"])
+            elif ctype == "WordBoundary":
+                offset_ticks = chunk.get("offset", 0)
+                duration_ticks = chunk.get("duration", 0)
+                start = offset_ticks / 10_000_000.0
+                end = (offset_ticks + duration_ticks) / 10_000_000.0
+                word_text = (chunk.get("text") or "").strip()
+                if not word_text:
+                    continue
+                words.append(
+                    WordTimestamp(
+                        word=word_text,
+                        start=start,
+                        end=end,
+                        terminator="",
+                    )
+                )
+        return audio_chunks, words
 
     # ============================================
-    # NÍVEL 2: Piper TTS (neural local)
+    # Piper TTS (fallback local)
     # ============================================
-    def _narrate_piper(self, text: str, output_path: Path) -> None:
-        """
-        Piper TTS: modelo neural local (não precisa internet após setup).
-        Baixa o modelo se não existir (primeira vez ~63MB).
-        Gera WAV via piper CLI, depois converte pra MP3.
-        """
+    def _piper_narrate(self, text: str, output_path: Path) -> None:
         model_path, config_path = self._ensure_piper_model()
-
-        # Piper gera WAV; salvamos num tmp e convertemos
         wav_path = output_path.with_suffix(".piper.wav")
-
-        # Roda piper via subprocess (piper-tts instalado via pip expõe CLI)
         cmd = [
             "piper",
             "--model", str(model_path),
@@ -246,11 +332,7 @@ class Narrator:
             "--output_file", str(wav_path),
         ]
         result = subprocess.run(
-            cmd,
-            input=text,
-            text=True,
-            capture_output=True,
-            timeout=120,
+            cmd, input=text, text=True, capture_output=True, timeout=120,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -258,33 +340,27 @@ class Narrator:
             )
         if not wav_path.exists() or wav_path.stat().st_size == 0:
             raise RuntimeError("Piper não gerou WAV")
-
-        # Converte WAV → MP3 via ffmpeg
         conv = subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(wav_path),
                 "-codec:a", "libmp3lame", "-b:a", "128k",
                 str(output_path),
             ],
-            capture_output=True,
-            text=True,
+            capture_output=True, text=True,
         )
         wav_path.unlink(missing_ok=True)
         if conv.returncode != 0:
             raise RuntimeError(f"ffmpeg WAV→MP3 falhou: {conv.stderr[-300:]}")
 
     def _ensure_piper_model(self) -> tuple[Path, Path]:
-        """Baixa modelo Piper na primeira vez (~63MB)."""
         PIPER_MODELS_DIR.mkdir(parents=True, exist_ok=True)
         model_path = PIPER_MODELS_DIR / f"{PIPER_VOICE_NAME}.onnx"
         config_path = PIPER_MODELS_DIR / f"{PIPER_VOICE_NAME}.onnx.json"
-
         if not model_path.exists():
             logger.info(f"Baixando modelo Piper {PIPER_VOICE_NAME} (~63MB)...")
             self._download(PIPER_MODEL_URL, model_path)
         if not config_path.exists():
             self._download(PIPER_CONFIG_URL, config_path)
-
         return model_path, config_path
 
     @staticmethod
@@ -296,35 +372,68 @@ class Narrator:
                     f.write(chunk)
 
     # ============================================
-    # NÍVEL 3: gTTS (último recurso)
+    # gTTS (último recurso)
     # ============================================
-    def _narrate_gtts(self, text: str, output_path: Path) -> None:
+    @staticmethod
+    def _gtts_narrate(text: str, output_path: Path) -> None:
         from gtts import gTTS
         tts = gTTS(text=text, lang="pt", tld="com.br", slow=False)
         tts.save(str(output_path))
 
+    # ============================================
+    # Concat sem gap (fluxo contínuo)
+    # ============================================
+    @staticmethod
+    def _concat(parts: list[Path], output: Path) -> None:
+        if len(parts) == 1:
+            # Copia direto
+            import shutil
+            shutil.copyfile(parts[0], output)
+            return
+        list_file = output.parent / f".concat_{output.stem}.txt"
+        with open(list_file, "w") as f:
+            for p in parts:
+                f.write(f"file '{p.resolve()}'\n")
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(list_file),
+                    "-c:a", "libmp3lame", "-b:a", "128k",
+                    str(output),
+                ],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Concat áudio falhou: {result.stderr[-500:]}")
+        finally:
+            list_file.unlink(missing_ok=True)
+
+    # ============================================
+    # Utilitário: listar vozes PT-BR disponíveis
+    # ============================================
     @staticmethod
     def list_brazilian_voices() -> list[dict]:
-        """Lista vozes brasileiras disponíveis no Edge TTS."""
         async def _list():
             voices = await edge_tts.list_voices()
             return [v for v in voices if v["Locale"].startswith("pt-BR")]
         return _run_async_safely(_list())
 
 
-# Voz recomendada por template
-VOICE_BY_TEMPLATE = {
-    "motivacional": "pt-BR-AntonioNeural",
-    "viral": "pt-BR-ThalitaNeural",
-    "noticias": "pt-BR-FranciscaNeural",
-    "gaming": "pt-BR-AntonioNeural",
-}
-
-
-# Ajuste de velocidade por template
-RATE_BY_TEMPLATE = {
-    "motivacional": "-5%",
-    "viral": "+15%",
-    "noticias": "+0%",
-    "gaming": "+20%",
-}
+def _probe_duration(path: Path) -> float:
+    """Duração em segundos via ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.warning(f"ffprobe duração falhou em {path.name}: {e}")
+        return 0.0

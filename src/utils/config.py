@@ -27,8 +27,11 @@ class Config:
     telegram_allowed_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_ALLOWED_CHAT_ID", ""))
 
     # Gemini (primário — melhor PT-BR)
+    # Usamos 2.5 Flash por padrão: 15 RPM / 1000 RPD no free tier + qualidade
+    # suficiente para prompts bem estruturados (outline + expand em 2 passes).
+    # 2.5 Pro é melhor em coesão mas só 2 RPM — estoura em pipelines multi-pass.
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
 
     # Groq (fallback)
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))

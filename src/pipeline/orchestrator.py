@@ -1,24 +1,28 @@
 """
 Orquestrador do pipeline: transforma um VideoRequest em vídeo final.
 
-Fluxo:
-1. Groq → roteiro estruturado
-2. Edge TTS → narração completa (MP3)
-3. Whisper → timestamp palavra-a-palavra
-4. Divide timestamps em cenas (alinhando com as frases do roteiro)
-5. Pra cada cena: busca mídia (vídeo/imagem/pessoa/fundo-cor)
-6. FFmpeg prepara cada clipe em 9:16 com movimento (Ken Burns etc.)
-7. Concatena clipes
-8. Gera legenda ASS animada
-9. Mixa narração + SFX + música e queima legendas
-10. Upload no R2 e retorna URL pública
+Fluxo (versão V2 — pós-reforma de qualidade):
+1. Gera roteiro em 2 passes (outline + expand) com few-shot real.
+2. Narra o roteiro INTEIRO via Edge TTS, variando rate por beat_type, e
+   coleta WordBoundary do stream (timestamps exatos).
+3. Se Edge TTS falhar e cair pra Piper/gTTS, rode Whisper como fallback
+   pra obter os timestamps.
+4. Alinha palavras → cenas por matching textual fuzzy (não mais proporcional).
+5. Pra cada cena: busca mídia (vídeo/imagem/pessoa/fundo-cor).
+6. FFmpeg prepara cada clipe em 9:16 com movimento (Ken Burns etc.).
+7. Concatena clipes.
+8. Gera legenda ASS animada (legendas já vêm sem pontuação porque word.word
+   é limpo).
+9. Mixa narração + SFX + música e queima legendas.
+10. Upload no R2 e retorna URL pública.
 """
 from __future__ import annotations
 
+import difflib
+import re
 import shutil
 import uuid
 from pathlib import Path
-from typing import Optional
 
 from src.editor.captions import build_caption_generator
 from src.editor.ffmpeg_engine import ClipPreparer, FinalAssembler, SceneConcatenator
@@ -32,7 +36,7 @@ from src.pipeline.models import (
     VideoRequest,
     WordTimestamp,
 )
-from src.pipeline.narrator import Narrator, RATE_BY_TEMPLATE, VOICE_BY_TEMPLATE
+from src.pipeline.narrator import Narrator, VOICE_BY_TEMPLATE
 from src.pipeline.script_writer import ScriptWriter
 from src.pipeline.transcriber import Transcriber
 from src.utils.config import config, OUTPUT_DIR, TEMP_DIR, ensure_dirs
@@ -69,73 +73,65 @@ class PipelineOrchestrator:
 
         try:
             # ==========================================
-            # 1. ROTEIRO
+            # 1. ROTEIRO (2 passes: outline + expand)
             # ==========================================
             job.status = "scripting"
             logger.info(f"[{job.job_id}] === ROTEIRO ===")
             job.script = self.script_writer.generate(request)
 
             # ==========================================
-            # 2. NARRAÇÃO (cena por cena com pausa entre elas)
+            # 2. NARRAÇÃO + WordBoundary timestamps
             # ==========================================
             job.status = "narrating"
             logger.info(f"[{job.job_id}] === NARRAÇÃO ===")
             voice = request.voice or VOICE_BY_TEMPLATE.get(
                 request.template.value, "pt-BR-AntonioNeural"
             )
-            rate = RATE_BY_TEMPLATE.get(request.template.value, "+0%")
             narrator = Narrator(voice=voice)
             narration_path = work_dir / "narration.mp3"
 
-            # Gap entre cenas varia por template
-            gap = {
-                "motivacional": 0.45,  # pausa maior pra peso emocional
-                "viral": 0.20,          # pausa curta pra manter ritmo
-                "noticias": 0.35,
-                "gaming": 0.15,
-            }.get(request.template.value, 0.35)
-
-            scene_texts = [line.text for line in job.script.lines]
-            narrator.narrate_scenes(
-                scene_texts=scene_texts,
+            narration_path, words = narrator.narrate_script(
+                script=job.script,
                 output_path=narration_path,
-                rate=rate,
-                gap_seconds=gap,
+                template=request.template.value,
             )
             job.narration_path = narration_path
 
             # ==========================================
-            # 3. TRANSCRIÇÃO palavra-a-palavra
+            # 3. FALLBACK: se não veio WordBoundary, usa Whisper
             # ==========================================
-            logger.info(f"[{job.job_id}] === TRANSCRIÇÃO ===")
-            transcriber = Transcriber(model_size="small")
-            words = transcriber.transcribe(narration_path)
+            if not words:
+                logger.info(
+                    f"[{job.job_id}] WordBoundary indisponível — chamando Whisper"
+                )
+                transcriber = Transcriber(model_size="small")
+                words = transcriber.transcribe(narration_path)
 
-            # Marca palavras de ênfase (união de todas as cenas)
-            all_emphasis = []
+            if not words:
+                raise RuntimeError(
+                    "Sem timestamps de palavras (nem Edge WordBoundary nem Whisper). "
+                    "Tente outro tema ou verifique o áudio da narração."
+                )
+
+            # Marca palavras de ênfase (union de todas as cenas)
+            all_emphasis: list[str] = []
             for line in job.script.lines:
                 all_emphasis.extend(line.emphasis_words)
             words = Transcriber.mark_emphasis(words, all_emphasis)
 
             # ==========================================
-            # 4. Divide palavras em cenas (alinhamento
-            #    por texto das frases do roteiro)
+            # 4. Alinha palavras → cenas (fuzzy matching)
             # ==========================================
-            if not words:
-                raise RuntimeError(
-                    "Whisper não detectou fala na narração. "
-                    "Tente outro tema ou verifique se o Edge TTS funcionou."
-                )
             job.scenes = self._align_words_to_scenes(job.script, words)
             if not job.scenes:
-                raise RuntimeError("Nenhuma cena gerada após alinhamento de palavras.")
+                raise RuntimeError("Nenhuma cena gerada após alinhamento")
 
             # ==========================================
             # 5+6. Busca mídia e prepara clipes 9:16
             # ==========================================
             job.status = "fetching_media"
             logger.info(f"[{job.job_id}] === MÍDIA + PREPARO ===")
-            clip_paths = []
+            clip_paths: list[Path] = []
             for idx, scene in enumerate(job.scenes):
                 self._attach_media(scene)
                 out_clip = work_dir / f"clip_{idx:02d}.mp4"
@@ -151,7 +147,7 @@ class PipelineOrchestrator:
             self.concat.concat(clip_paths, job.scenes, concat_video)
 
             # ==========================================
-            # 8. Legendas ASS
+            # 8. Legendas ASS (já vêm sem pontuação — word.word é limpo)
             # ==========================================
             logger.info(f"[{job.job_id}] === LEGENDAS ASS ===")
             caption_gen = build_caption_generator(
@@ -172,8 +168,8 @@ class PipelineOrchestrator:
                 narration_path=narration_path,
                 subtitle_ass_path=ass_path,
                 output_path=final_path,
-                music_path=None,  # TODO: música de fundo opcional
-                sfx_events=None,  # TODO: SFX automático
+                music_path=None,  # PR 3: música de fundo
+                sfx_events=None,
             )
             job.final_video_path = final_path
             job.status = "done"
@@ -188,62 +184,113 @@ class PipelineOrchestrator:
         return job
 
     # ============================================
-    # Alinhamento: cada ScriptLine → janela de palavras do Whisper
+    # Alinhamento FUZZY: cada ScriptLine → janela de palavras reais
     # ============================================
     @staticmethod
     def _align_words_to_scenes(
         script: Script, words: list[WordTimestamp]
     ) -> list[Scene]:
         """
-        Distribui as palavras transcritas entre as frases do roteiro
-        proporcionalmente ao número de palavras de cada frase.
+        Encontra, pra cada frase do roteiro, onde ela COMEÇA na lista de
+        palavras transcritas/boundary-detectadas. Usa SequenceMatcher do
+        difflib pra permitir divergências (TTS pode pronunciar diferente).
 
-        Simples e robusto: usa contagem de palavras em vez de matching
-        textual (que é frágil com pontuação e TTS).
+        Fallback: se matching falha pra uma cena, usa fatia proporcional
+        (algoritmo antigo) só pra aquela cena — não derruba o pipeline.
+
+        Retorna cenas com start/end baseados nos timestamps REAIS das palavras.
         """
-        script_word_counts = [len(line.text.split()) for line in script.lines]
-        total_expected = sum(script_word_counts)
-        if total_expected == 0 or not words:
+        if not words or not script.lines:
             return []
 
+        n_words = len(words)
+        script_word_counts = [len(line.text.split()) for line in script.lines]
+        total_expected = sum(script_word_counts)
+        if total_expected == 0:
+            return []
+
+        # Lista de tokens normalizados das words (sem pontuação, lowercase)
+        token_stream = [_normalize(w.word) for w in words]
+
+        cursor = 0
         scenes: list[Scene] = []
-        cursor = 0  # índice na lista de words
-        for line, expected_count in zip(script.lines, script_word_counts):
-            # Quantas palavras pegar pra essa cena
-            # Escala pelo total real (caso Whisper detecte mais/menos)
-            scaled = max(1, round(len(words) * (expected_count / total_expected)))
-            end_idx = min(cursor + scaled, len(words))
-            window = words[cursor:end_idx]
-            if not window:
-                break
+        for i, line in enumerate(script.lines):
+            script_tokens = [_normalize(t) for t in line.text.split() if _normalize(t)]
+            if not script_tokens:
+                continue
 
-            scene = Scene(
-                script_line=line,
-                start_time=window[0].start,
-                end_time=window[-1].end,
-                words=window,
+            # Janela esperada: tamanho ~= nº de palavras no script da cena,
+            # com +50% de folga e começando no cursor.
+            expected = len(script_tokens)
+            window_end_default = min(cursor + int(expected * 1.5) + 4, n_words)
+
+            # Busca a melhor substring começando em [cursor, window_end_default]
+            best_start = _find_best_start(
+                haystack=token_stream,
+                needle=script_tokens,
+                search_from=cursor,
+                search_to=min(cursor + int(expected * 2) + 6, n_words),
             )
-            scenes.append(scene)
-            cursor = end_idx
 
-        # Se sobraram palavras, anexa na última cena
-        if cursor < len(words) and scenes:
+            if best_start < 0:
+                # Fallback proporcional pra esta cena
+                scaled = max(1, round(n_words * (expected / total_expected)))
+                scene_start = cursor
+                scene_end = min(cursor + scaled, n_words)
+            else:
+                scene_start = best_start
+                # Próxima cena começa onde essa termina (aprox.)
+                if i + 1 < len(script.lines):
+                    next_tokens = [
+                        _normalize(t)
+                        for t in script.lines[i + 1].text.split()
+                        if _normalize(t)
+                    ]
+                    next_start = (
+                        _find_best_start(
+                            haystack=token_stream,
+                            needle=next_tokens,
+                            search_from=best_start + 1,
+                            search_to=min(best_start + expected * 2 + 8, n_words),
+                        )
+                        if next_tokens
+                        else -1
+                    )
+                    scene_end = (
+                        next_start
+                        if next_start > best_start
+                        else min(best_start + expected + 2, n_words)
+                    )
+                else:
+                    scene_end = n_words  # última cena pega até o fim
+
+            window = words[scene_start:scene_end]
+            if not window:
+                continue
+
+            scenes.append(
+                Scene(
+                    script_line=line,
+                    start_time=window[0].start,
+                    end_time=window[-1].end,
+                    words=list(window),
+                )
+            )
+            cursor = scene_end
+
+        # Ajusta sobras: se última cena não cobriu até o fim, anexa tail
+        if scenes and cursor < n_words:
             tail = words[cursor:]
             scenes[-1].words.extend(tail)
             scenes[-1].end_time = tail[-1].end
 
-        # Garante duração mínima SEM:
-        # - expandir além do total da narração (-shortest cortaria narração)
-        # - sobrepor com a cena seguinte (causa desalinhamento de legendas)
+        # Garante duração mínima sem sobrepor com a próxima cena
         MIN_DURATION = 1.0
         total_end = scenes[-1].end_time if scenes else 0
         for i, sc in enumerate(scenes):
             if sc.duration < MIN_DURATION:
-                # Limite superior: início da próxima cena (ou fim do áudio)
                 upper_limit = (
-                    scenes[i + 1].start_time
-                    if i + 1 < len(scenes)
-                    else total_end
+                    scenes[i + 1].start_time if i + 1 < len(scenes) else total_end
                 )
                 new_end = min(sc.start_time + MIN_DURATION, upper_limit)
                 if new_end > sc.end_time:
@@ -258,28 +305,104 @@ class PipelineOrchestrator:
         line = scene.script_line
         st = line.scene_type
 
+        # Queries: usa visual_queries se tiver, senão visual_query
+        queries = [q for q in (line.visual_queries or [line.visual_query]) if q]
+        primary_query = queries[0] if queries else "cinematic"
+
         if st == SceneType.VIDEO_BROLL:
-            path = self.media.fetch_video(line.visual_query or "cinematic")
+            path = self.media.fetch_video(primary_query)
             if not path:
                 # Fallback: imagem
-                path = self.media.fetch_image(line.visual_query or "abstract")
+                path = self.media.fetch_image(primary_query or "abstract")
                 if path:
                     line.scene_type = SceneType.IMAGE_KENBURNS
             scene.media_path = path
 
         elif st == SceneType.IMAGE_KENBURNS:
-            scene.media_path = self.media.fetch_image(line.visual_query or "inspiration")
+            scene.media_path = self.media.fetch_image(primary_query or "inspiration")
 
         elif st == SceneType.PERSON_PHOTO:
             if line.person_name:
                 scene.media_path = self.media.fetch_person(line.person_name)
             if not scene.media_path:
-                # Cai pra imagem genérica
-                scene.media_path = self.media.fetch_image(line.visual_query or "portrait")
+                scene.media_path = self.media.fetch_image(primary_query or "portrait")
                 line.scene_type = SceneType.IMAGE_KENBURNS
 
         elif st == SceneType.COLOR_BACKGROUND:
             scene.media_path = None  # gerado via lavfi
+
+
+# ============================================
+# Helpers de matching
+# ============================================
+_NORMALIZE_RE = re.compile(r"[^\w]", re.UNICODE)
+
+
+def _normalize(token: str) -> str:
+    """Lowercase + remove pontuação pra comparação fuzzy."""
+    return _NORMALIZE_RE.sub("", token.lower().strip())
+
+
+def _find_best_start(
+    haystack: list[str],
+    needle: list[str],
+    search_from: int,
+    search_to: int,
+    min_ratio: float = 0.5,
+) -> int:
+    """
+    Encontra índice em `haystack` onde começa uma janela que melhor
+    corresponde a `needle` (lista de tokens da cena).
+
+    Usa SequenceMatcher.ratio() numa janela deslizante. Retorna -1 se nenhum
+    candidato passar do threshold.
+
+    Estratégia: compara a primeira palavra da cena (âncora) primeiro, depois
+    a janela de len(needle) palavras em volta. Mais rápido que brute-force
+    em cada posição.
+    """
+    if not needle or search_from >= search_to:
+        return -1
+
+    # Âncora: primeira palavra relevante da needle
+    anchor = needle[0]
+    if not anchor:
+        return search_from  # fallback neutro
+
+    # Candidatos: posições onde a âncora bate ou se parece muito
+    candidates: list[int] = []
+    for i in range(search_from, search_to):
+        if i >= len(haystack):
+            break
+        tok = haystack[i]
+        if tok == anchor:
+            candidates.append(i)
+        elif len(anchor) > 3 and (anchor.startswith(tok[:3]) or tok.startswith(anchor[:3])):
+            # Match fraco — só se âncora for palavra "grande" pra evitar
+            # falsos positivos com preposições curtas
+            if difflib.SequenceMatcher(None, tok, anchor).ratio() >= 0.7:
+                candidates.append(i)
+
+    if not candidates:
+        # Sem nenhuma âncora: usa search_from como fallback soft
+        return search_from if search_from < len(haystack) else -1
+
+    # Pra cada candidato, mede match da janela inteira
+    best_idx = -1
+    best_ratio = min_ratio
+    needle_joined = " ".join(needle)
+    for c in candidates:
+        window = haystack[c : c + len(needle)]
+        window_joined = " ".join(window)
+        ratio = difflib.SequenceMatcher(None, window_joined, needle_joined).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_idx = c
+
+    # Se nenhum passou do threshold, usa primeiro candidato (ainda melhor que random)
+    if best_idx < 0 and candidates:
+        best_idx = candidates[0]
+    return best_idx
 
 
 def cleanup_job(job_id: str) -> None:

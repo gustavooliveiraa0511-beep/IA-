@@ -1,341 +1,501 @@
 """
-Gera roteiro estruturado usando IA — cascata Gemini → Groq.
+Gera roteiro estruturado com foco em COESÃO usando IA.
 
-Estratégia:
-1. Gemini 2.0 Flash (Google) — primário, melhor PT-BR e mais disciplinado
-2. Groq Llama 3.3 70B — fallback se Gemini falhar/rate limit
+Arquitetura de 2 passes (outline-first + expand + few-shot real):
+1. Pass A (OUTLINE): gera só os beats (1 linha/cena) forçando estrutura
+   narrativa Hook → Development → Climax → CTA.
+2. Pass B (EXPAND): transforma cada bullet em cena completa, com few-shot
+   de roteiros virais reais. Cada cena começa com conector explícito
+   ("Mas...", "Porque...", "Entenda:", etc.), referenciando a anterior.
 
-Ambos têm:
-- Free tier generoso
-- Suporte a structured output (JSON)
-- Boa qualidade em português brasileiro
+Modo premium opcional (SCRIPT_QUALITY_MODE=premium):
+- Roda Pass B três vezes em paralelo e pede pra IA escolher o mais coeso.
+- Custa 3x tokens mas cabe em 1000 RPD do Gemini 2.5 Flash free tier.
 
-Se o roteiro vier curto demais, a gente faz 2ª chamada pra expandir.
-Nunca falha o pipeline por tamanho — só loga warning.
+Cascata de fallback:
+- Primário: Gemini 2.5 Flash (15 RPM, 1000 RPD)
+- Fallback 1: Gemini 2.0 Flash (alto throughput)
+- Fallback 2: Groq Llama 3.3 70B
+- Fallback final: usa só o OUTLINE expandido mecanicamente (nunca crasha)
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import os
 import re
-from typing import Any, Optional
+from functools import lru_cache
+from typing import Any, Callable
 
 import google.generativeai as genai
 from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.pipeline.models import Script, ScriptLine, SceneType, TemplateType, VideoRequest
-from src.utils.config import config
+from src.pipeline.models import (
+    BeatType,
+    Script,
+    ScriptLine,
+    SceneType,
+    TemplateType,
+    VideoRequest,
+)
+from src.utils.config import ASSETS_DIR, config
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-TEMPLATE_INSTRUCTIONS = {
-    TemplateType.MOTIVACIONAL: """
-Estilo MOTIVACIONAL:
-- Hook de impacto nos primeiros 3 segundos (frase que pare o scroll)
-- Linguagem firme, direta, inspiradora
-- Use "você" (fala direto com o espectador)
-- Pelo menos 2 cenas de COLOR_BACKGROUND com frases de impacto curtas
-- Cenas de VIDEO_BROLL com pessoas em ação (correndo, vencendo, trabalhando)
-- Finalize com call-to-action ("siga pra mais", "salva esse vídeo", etc.)
-- Cores de fundo: preto (#000000), laranja-fogo (#ff4500), dourado (#daa520), vermelho (#b22222)
-""",
-    TemplateType.VIRAL: """
-Estilo VIRAL / CURIOSIDADES:
-- Hook com pergunta ou fato surpreendente
-- Ritmo acelerado, cenas curtas
-- Revele a informação por etapas (curiosity gap)
-- Mistura VIDEO_BROLL e IMAGE_KENBURNS
-- Final com gancho pra próximo vídeo
-""",
-    TemplateType.NOTICIAS: """
-Estilo NOTÍCIAS / INFORMATIVO:
-- Apresente o fato de forma clara nos primeiros segundos
-- Use PERSON_PHOTO quando citar pessoas públicas (defina person_name)
-- Ritmo médio, cenas de 2-3 segundos
-- Tom neutro e informativo
-""",
-    TemplateType.GAMING: """
-Estilo GAMING / ENTRETENIMENTO:
-- Energia alta, gírias jovens
-- Cenas curtíssimas (~1s)
-- Muita ênfase em palavras-chave
-- VIDEO_BROLL com gameplay ou cenas dinâmicas
-""",
+# ============================================
+# FEW-SHOT: roteiros virais reais
+# ============================================
+SCRIPT_EXAMPLES_DIR = ASSETS_DIR / "script_examples"
+
+
+@lru_cache(maxsize=8)
+def _load_example(name: str) -> str:
+    """Carrega roteiro exemplo (arquivo .txt) e retorna o conteúdo cru."""
+    path = SCRIPT_EXAMPLES_DIR / f"{name}.txt"
+    if not path.exists():
+        logger.warning(f"Exemplo {name} não encontrado em {path}")
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _few_shot_for(template: TemplateType) -> str:
+    """Retorna 2 roteiros exemplo do mesmo template (fallback pro motivacional)."""
+    mapping = {
+        TemplateType.MOTIVACIONAL: ["motivacional_1", "motivacional_2"],
+        TemplateType.VIRAL: ["viral_1", "viral_2"],
+        TemplateType.NOTICIAS: ["viral_1", "viral_2"],  # estilo informativo
+        TemplateType.GAMING: ["viral_1", "viral_2"],
+    }
+    names = mapping.get(template, ["motivacional_1", "motivacional_2"])
+    parts = []
+    for n in names:
+        content = _load_example(n)
+        if content:
+            parts.append(f"━━━ EXEMPLO: {n} ━━━\n{content}")
+    return "\n\n".join(parts)
+
+
+# ============================================
+# PROMPTS
+# ============================================
+TEMPLATE_FLAVOR = {
+    TemplateType.MOTIVACIONAL: (
+        "tom firme e inspirador, linguagem direta em 'você', beats de superação "
+        "com exemplos concretos (Kobe, Jocko, Rowling, Edison, atletas, empreendedores)"
+    ),
+    TemplateType.VIRAL: (
+        "tom de curiosidade/revelação, hook com pergunta ou fato surpreendente, "
+        "revelação em camadas (curiosity gap)"
+    ),
+    TemplateType.NOTICIAS: (
+        "tom informativo e claro, fato principal nos primeiros 3s, linguagem neutra"
+    ),
+    TemplateType.GAMING: (
+        "tom energético, gírias jovens, cenas curtíssimas, muita ênfase em keywords"
+    ),
 }
 
 
-SYSTEM_PROMPT = """Você é um roteirista ESPECIALISTA em vídeos virais de {duration} segundos para TikTok/Reels em português brasileiro. Seu estilo é PROFUNDO, não superficial.
+OUTLINE_PROMPT = """Você é um editor-chefe de vídeos virais para TikTok/Reels em PT-BR.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 META: ROTEIRO COM {target_words} PALAVRAS, PROFUNDIDADE REAL.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TAREFA: Gere um OUTLINE (só bullets, 1 linha por cena) de um vídeo de {duration}s sobre:
+TEMA: {theme}
 
-⛔ PROIBIDO:
-- Frases genéricas ("acredite em si", "vá em frente", "você consegue")
-- Repetir a MESMA ideia com palavras diferentes
-- Clichês vazios sem substância
-- Listas soltas de afirmações desconectadas
+ESTILO: {flavor}
 
-✅ OBRIGATÓRIO:
-- Cada cena deve ADICIONAR algo novo ao argumento
-- Use EXEMPLOS CONCRETOS: "como atleta correndo maratona", "como o Neymar aos 14 anos"
-- Use ANALOGIAS específicas: "a dor de crescer é a mesma dor do músculo que se rompe pra ficar mais forte"
-- Alterne frases CURTAS de impacto com frases LONGAS de desenvolvimento
-- Use VÍRGULAS, pontos finais e reticências pra criar RITMO (importante: narração vai seguir a pontuação)
+━━━ ESTRUTURA OBRIGATÓRIA ━━━
+1. HOOK (1 cena): frase que PARA o scroll. Pergunta, contradição, ou promessa inesperada.
+2. DEVELOPMENT (3-5 cenas): cada uma ADICIONA uma camada nova ao argumento. Use nomes concretos, números, exemplos específicos.
+3. CLIMAX (1-2 cenas): a VIRADA. A frase-chave que resume tudo. É aqui que você fala o que o vídeo inteiro tava construindo.
+4. CTA (1 cena): chamada final — salvar, seguir, refletir.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📝 EXEMPLO DE ROTEIRO EXCELENTE (tema: "nunca desista"):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Cena 1: "Se você tá pensando em desistir agora, precisa ouvir isso antes de fazer qualquer coisa."
-Cena 2: "Nenhum grande nome que você admira chegou onde está por talento. Chegou por teimosia."
-Cena 3: "O Edison errou dois mil filamentos antes de achar o certo. Cada erro foi um passo."
-Cena 4: "A Joanne Rowling foi recusada por doze editoras. Hoje Harry Potter salvou a vida dela."
-Cena 5: "O que separa quem venceu de quem desistiu não é capacidade. É um dia a mais de esforço."
-Cena 6: "Quando você quer parar, entenda: é exatamente ali que o resultado começa a aparecer."
-Cena 7: "O universo cobra antes de entregar. Paga o preço. Aguenta o pior. E vai até o fim."
-Cena 8: "Salva esse vídeo. Assiste de novo quando a vontade de desistir voltar."
-
-TOTAL: 112 palavras. Observações:
-✅ Cada cena traz uma ideia NOVA (talento vs teimosia, exemplos reais, explicação do mecanismo)
-✅ Usa casos concretos (Edison, Rowling) pra não virar clichê
-✅ Alterna ritmo: frases curtas e longas, muito uso de vírgulas e pontos
-✅ Constrói argumento em camadas: contexto → exemplos → insight → call to action
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⛔ EXEMPLO DE ROTEIRO RUIM (NUNCA FAÇA):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Cena 1: "Acredite em si mesmo"
-Cena 2: "Você é capaz de tudo"
-Cena 3: "Nunca desista dos sonhos"
-Cena 4: "Continue tentando sempre"
-Cena 5: "Você vai conseguir"
-
-❌ Por quê é ruim:
-- Todas as frases dizem a MESMA COISA
-- Nenhum exemplo concreto
-- Nenhuma analogia
-- Sem pontuação natural → narração sai corrida
-- Sem progressão de argumento
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📐 REGRAS TÉCNICAS:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ TOTAL: {target_words} palavras (±15%)
-✅ CENAS: {min_scenes} a {max_scenes} cenas
-✅ POR CENA: 10 a 20 palavras com pontuação natural (pontos, vírgulas, reticências)
-✅ Use frases completas que terminam com ponto final. Isso cria PAUSA NATURAL na narração.
-✅ SEMPRE use dados/exemplos concretos quando possível (nomes, números, situações específicas)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-{template_instructions}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎬 TIPOS DE CENA:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-- "video_broll": Ações e movimento (corrida, trabalho, esporte)
-- "image_kenburns": Conceitos abstratos com zoom (céu, montanha, livro)
-- "color_background": Fundo liso com FRASE CENTRAL. Máx 2 vezes.
-- "person_photo": Só se citar pessoa famosa específica (Edison, Rowling, Jobs)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📦 FORMATO JSON DA RESPOSTA:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+━━━ FORMATO DE SAÍDA (só JSON) ━━━
 {{
-  "title": "título curto do vídeo",
-  "hashtags": ["#motivacao", "#mindset", "#disciplina"],
+  "title": "título curto",
+  "hashtags": ["#tag1", "#tag2", "#tag3"],
+  "beats": [
+    {{"role": "hook", "idea": "1 frase resumindo a cena"}},
+    {{"role": "development", "idea": "..."}},
+    {{"role": "climax", "idea": "..."}},
+    {{"role": "cta", "idea": "..."}}
+  ]
+}}
+
+━━━ REGRAS ━━━
+- Total de beats: {min_scenes} a {max_scenes}.
+- Cada `idea` tem 8-15 palavras, resume a essência da cena.
+- NÃO escreva a cena completa ainda — só o núcleo da ideia.
+- Evite clichês ("nunca desista", "acredite em si") — force ângulo específico.
+
+Responda SÓ o JSON."""
+
+
+EXPAND_PROMPT = """Você é um roteirista de vídeos virais para TikTok/Reels em PT-BR.
+
+TAREFA: Expandir o OUTLINE abaixo em roteiro completo de {target_words} palavras.
+
+━━━ TEMA ━━━
+{theme}
+
+━━━ OUTLINE ━━━
+{outline_json}
+
+━━━ ESTILO DO TEMPLATE ━━━
+{flavor}
+
+━━━ EXEMPLOS DE ROTEIROS QUE FUNCIONAM (ESTUDE A ESTRUTURA) ━━━
+{few_shot}
+
+━━━ REGRAS CRÍTICAS ━━━
+
+1. **COESÃO OBRIGATÓRIA**: Cada cena (EXCETO a primeira, que é o hook) DEVE começar com um conector que amarra à anterior:
+   - "Mas...", "Porque...", "E aqui está o ponto:", "Entenda:", "Pense assim:",
+     "É aqui que...", "E tem mais:", "Só que...", "Por isso...", "Agora,".
+   - Sem exceção. Se a cena começa sem conector, o roteiro é REJEITADO.
+
+2. **PROIBIDO**:
+   - Frases genéricas: "acredite em si", "vá em frente", "você consegue", "nunca desista", "os sonhos importam"
+   - Repetir a MESMA ideia com palavras diferentes entre cenas
+   - Clichês motivacionais vazios sem exemplo concreto
+   - Abrir cena sem conector (quebra a coesão e é o bug que queremos consertar)
+
+3. **OBRIGATÓRIO**:
+   - Cada cena de `development` deve trazer EVIDÊNCIA CONCRETA: nome próprio, número, analogia física, exemplo histórico.
+   - `climax` é onde você fala o INSIGHT — a frase que o espectador vai querer printar.
+   - Frases curtas alternando com frases longas (pontos finais = pausa, vírgulas = meia-pausa).
+   - Usar pontuação COMO INSTRUMENTO DE RITMO. Pontos finais criam pausa de respiração na narração.
+
+4. **TAMANHO**: {min_words}-{max_words} palavras no total. Cada cena: 8-20 palavras.
+
+━━━ TIPOS DE CENA ━━━
+- "video_broll": ação, movimento (correr, trabalhar, vencer, falar em público)
+- "image_kenburns": conceito abstrato (céu, livro, mapa, montanha)
+- "color_background": fundo liso com frase de impacto CENTRAL. Máx 2 vezes no roteiro inteiro.
+- "person_photo": só se citar pessoa famosa específica (preencha `person_name`)
+
+━━━ FORMATO JSON DE SAÍDA ━━━
+{{
+  "title": "título curto",
+  "hashtags": ["#tag1", "#tag2"],
   "lines": [
     {{
-      "text": "Frase completa, com pontuação natural, trazendo ideia nova.",
+      "text": "Frase completa com pontuação natural, começando com conector (exceto hook).",
       "scene_type": "video_broll",
-      "visual_query": "termos EM INGLÊS (ex: person running sunrise)",
+      "visual_queries": ["3 queries EM INGLÊS, mais geral → mais específica", "person running sunrise", "determined athlete training"],
       "person_name": null,
       "bg_color": null,
-      "emphasis_words": ["palavra_chave1", "palavra_chave2"]
+      "emphasis_words": ["palavra_chave1", "palavra_chave2"],
+      "beat_type": "hook"
     }}
   ]
 }}
 
-⚠️ ANTES DE RESPONDER, faça 3 checks:
-1. Contar palavras: total é >= {min_words}?
-2. Cada cena traz ideia NOVA ou só repete?
-3. Tem pontuação pra criar pausas naturais na narração?
+━━━ CHECKLIST ANTES DE RESPONDER ━━━
+1. Cada cena (menos a primeira) começa com conector? (Se não, reescreva)
+2. Cada cena de development tem exemplo CONCRETO? (Se não, adicione)
+3. Total ≥ {min_words} palavras? (Se não, expanda)
+4. Pontuação criando ritmo? (pontos = pausa grande, vírgulas = pausa curta)
 
-Se algum check falhar, REESCREVA.
-"""
-
-
-EXPAND_PROMPT = """O roteiro abaixo tem APENAS {current_words} palavras, mas precisa ter {target_words}.
-
-ROTEIRO ATUAL:
-{current_script}
-
-⚠️ TAREFA: EXPANDA esse roteiro mantendo o mesmo tema e tom, mas adicionando MAIS CENAS e EXPANDINDO as existentes pra atingir {target_words} palavras no total.
-
-Retorne APENAS o JSON expandido no mesmo formato (title, hashtags, lines).
-Cada cena deve ter 8-18 palavras COMPLETAS. Não corte palavras, ESCREVA MAIS.
-"""
+Responda SÓ o JSON."""
 
 
+SELECT_BEST_PROMPT = """Você tem 3 roteiros abaixo para o mesmo tema. Responda SÓ o número (1, 2 ou 3) do mais COESO: o que melhor amarra as cenas umas nas outras, com conectores claros e argumento que flui.
+
+Priorize: COESÃO > CONCRETUDE > TAMANHO. Ignore beleza poética — queremos fluxo de argumento.
+
+━━━ CANDIDATO 1 ━━━
+{script_1}
+
+━━━ CANDIDATO 2 ━━━
+{script_2}
+
+━━━ CANDIDATO 3 ━━━
+{script_3}
+
+Responda SÓ o número: 1, 2 ou 3."""
+
+
+# ============================================
+# ScriptWriter
+# ============================================
 class ScriptWriter:
     def __init__(self) -> None:
-        # Inicializa clientes disponíveis
         self.gemini_available = bool(config.gemini_api_key)
         self.groq_available = bool(config.groq_api_key)
-
         if self.gemini_available:
             genai.configure(api_key=config.gemini_api_key)
-            self.gemini_client = genai.GenerativeModel(config.gemini_model)
-
         if self.groq_available:
             self.groq_client = Groq(api_key=config.groq_api_key)
-
         if not self.gemini_available and not self.groq_available:
             raise ValueError(
                 "Nenhuma IA configurada. Configure GEMINI_API_KEY ou GROQ_API_KEY."
             )
-
         logger.info(
             f"ScriptWriter: Gemini={'✅' if self.gemini_available else '❌'} | "
             f"Groq={'✅' if self.groq_available else '❌'}"
         )
 
+    # ============================================
+    # API pública
+    # ============================================
     def generate(self, request: VideoRequest) -> Script:
         """
-        Gera roteiro com cascata Gemini → Groq, expansão se curto,
-        e nunca trava o pipeline.
+        Geração em 2 passes: outline → expand.
+        Em modo premium: 3 expands paralelos + seleção.
         """
-        logger.info(f"Gerando roteiro: tema={request.theme!r} template={request.template}")
-
         duration = request.duration_seconds
         target_words = int(duration * 150 / 60)
         min_words = int(target_words * 0.80)
         max_words = int(target_words * 1.30)
         min_scenes = max(5, duration // 6)
         max_scenes = max(8, duration // 3)
+        flavor = TEMPLATE_FLAVOR.get(request.template, "")
 
-        system = SYSTEM_PROMPT.format(
+        logger.info(
+            f"[ScriptWriter] tema={request.theme!r} template={request.template.value} "
+            f"target={target_words} palavras {min_scenes}-{max_scenes} cenas"
+        )
+
+        # ==============================
+        # PASS A — OUTLINE
+        # ==============================
+        outline = self._generate_outline(
+            theme=request.theme,
             duration=duration,
+            flavor=flavor,
+            min_scenes=min_scenes,
+            max_scenes=max_scenes,
+        )
+        logger.info(f"[ScriptWriter] Outline: {len(outline.get('beats', []))} beats")
+
+        # ==============================
+        # PASS B — EXPAND (com modo premium opcional)
+        # ==============================
+        few_shot = _few_shot_for(request.template)
+        premium = os.getenv("SCRIPT_QUALITY_MODE", "standard").lower() == "premium"
+
+        expand_fn: Callable[[], Script] = lambda: self._expand_outline(
+            theme=request.theme,
+            outline=outline,
+            flavor=flavor,
+            few_shot=few_shot,
             target_words=target_words,
             min_words=min_words,
             max_words=max_words,
-            min_scenes=min_scenes,
-            max_scenes=max_scenes,
-            template_instructions=TEMPLATE_INSTRUCTIONS[request.template],
         )
-        user = (
-            f"TEMA: {request.theme}\n\n"
-            f"Escreva um roteiro de {target_words} palavras "
-            f"(distribuídas em {min_scenes}-{max_scenes} cenas de 8-18 palavras cada). "
-            f"Siga o exemplo do sistema.\n\n"
-            f"Conte as palavras antes de responder."
-        )
-        if request.custom_script:
-            user += f"\n\nTexto base do usuário (adapte em cenas):\n{request.custom_script}"
 
-        # === TENTATIVA 1: geração (Gemini primário, Groq fallback) ===
-        script = self._generate_with_fallback(system, user)
+        if premium:
+            logger.info("[ScriptWriter] Modo PREMIUM: 3 rascunhos paralelos + seleção")
+            script = self._premium_expand(expand_fn)
+        else:
+            try:
+                script = expand_fn()
+            except Exception as e:
+                logger.warning(
+                    f"[ScriptWriter] Expand falhou ({type(e).__name__}), caindo pro outline mecânico: {e}"
+                )
+                script = self._mechanical_from_outline(outline, request.template)
+
         word_count = len(script.full_text.split())
         logger.info(
-            f"Tentativa 1: {len(script.lines)} cenas, {word_count} palavras "
-            f"(meta {target_words})"
+            f"[ScriptWriter] Final: {len(script.lines)} cenas, {word_count} palavras"
         )
-
-        # === TENTATIVA 2: expansão se curto ===
-        if word_count < min_words:
-            logger.warning(
-                f"Roteiro curto ({word_count} < {min_words}). "
-                f"Pedindo pra IA EXPANDIR..."
-            )
-            try:
-                current_script = "\n".join(f"- {line.text}" for line in script.lines)
-                expand_user = EXPAND_PROMPT.format(
-                    current_words=word_count,
-                    target_words=target_words,
-                    current_script=current_script,
-                )
-                expand_system = (
-                    "Você é um roteirista expandindo um roteiro curto. "
-                    "Retorne JSON válido."
-                )
-                expanded = self._generate_with_fallback(expand_system, expand_user)
-                expanded_words = len(expanded.full_text.split())
-                logger.info(f"Após expansão: {expanded_words} palavras")
-                if expanded_words > word_count:
-                    script = expanded
-                    word_count = expanded_words
-            except Exception as e:
-                logger.warning(f"Expansão falhou: {e}. Usando o roteiro original.")
-
-        # === FALLBACK FINAL: não crasha, só alerta ===
-        if word_count < min_words * 0.5:
-            logger.warning(
-                f"⚠️ Roteiro final com {word_count} palavras (alvo {target_words}). "
-                f"Vídeo vai ficar mais curto que o ideal mas será gerado."
-            )
-
         return script
 
     # ============================================
-    # Cascata Gemini → Groq
+    # PASS A: OUTLINE
     # ============================================
-    def _generate_with_fallback(self, system: str, user: str) -> Script:
-        """
-        Tenta Gemini primeiro. Se falhar, cai pro Groq.
-        """
-        # Nível 1: Gemini
-        if self.gemini_available:
+    def _generate_outline(
+        self,
+        theme: str,
+        duration: int,
+        flavor: str,
+        min_scenes: int,
+        max_scenes: int,
+    ) -> dict[str, Any]:
+        prompt = OUTLINE_PROMPT.format(
+            theme=theme,
+            duration=duration,
+            flavor=flavor,
+            min_scenes=min_scenes,
+            max_scenes=max_scenes,
+        )
+        raw = self._call_with_fallback(
+            system="Você é um editor-chefe de conteúdo viral. Responda só JSON válido.",
+            user=prompt,
+            max_tokens=1200,
+        )
+        data = self._parse_json(raw)
+        if not data.get("beats"):
+            raise RuntimeError("Outline vazio — IA não retornou beats")
+        return data
+
+    # ============================================
+    # PASS B: EXPAND
+    # ============================================
+    def _expand_outline(
+        self,
+        theme: str,
+        outline: dict[str, Any],
+        flavor: str,
+        few_shot: str,
+        target_words: int,
+        min_words: int,
+        max_words: int,
+    ) -> Script:
+        outline_json = json.dumps(outline, ensure_ascii=False, indent=2)
+        prompt = EXPAND_PROMPT.format(
+            theme=theme,
+            outline_json=outline_json,
+            flavor=flavor,
+            few_shot=few_shot,
+            target_words=target_words,
+            min_words=min_words,
+            max_words=max_words,
+        )
+        raw = self._call_with_fallback(
+            system=(
+                "Você é um roteirista de vídeos virais em PT-BR obcecado por COESÃO. "
+                "Cada cena referencia a anterior com conector explícito. Responda só JSON."
+            ),
+            user=prompt,
+            max_tokens=4000,
+        )
+        data = self._parse_json(raw)
+        script = self._to_script(data, outline)
+        if not script.lines:
+            raise RuntimeError("Expand retornou roteiro vazio")
+        return script
+
+    # ============================================
+    # Modo PREMIUM: 3 rascunhos paralelos + seleção
+    # ============================================
+    def _premium_expand(self, expand_fn: Callable[[], Script]) -> Script:
+        # Roda 3 expansões em paralelo (cada uma é rate-limitada internamente)
+        scripts: list[Script] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(expand_fn) for _ in range(3)]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    scripts.append(f.result())
+                except Exception as e:
+                    logger.warning(f"[Premium] 1 rascunho falhou: {e}")
+
+        if not scripts:
+            raise RuntimeError("Nenhum rascunho premium gerou sucesso")
+        if len(scripts) == 1:
+            return scripts[0]
+
+        # Preenche com cópia se vierem <3 (prompt fixo)
+        while len(scripts) < 3:
+            scripts.append(scripts[0])
+
+        # Pede pra IA escolher o melhor
+        try:
+            raw = self._call_with_fallback(
+                system="Você é editor-chefe. Responda SÓ o número, sem explicação.",
+                user=SELECT_BEST_PROMPT.format(
+                    script_1=scripts[0].full_text,
+                    script_2=scripts[1].full_text,
+                    script_3=scripts[2].full_text,
+                ),
+                max_tokens=8,
+            )
+            # Extrai primeiro dígito 1-3
+            match = re.search(r"[123]", raw)
+            chosen_idx = (int(match.group(0)) - 1) if match else 0
+            chosen_idx = max(0, min(chosen_idx, len(scripts) - 1))
+            logger.info(f"[Premium] escolhido rascunho {chosen_idx + 1}")
+            return scripts[chosen_idx]
+        except Exception as e:
+            logger.warning(f"[Premium] seleção falhou, usando primeiro: {e}")
+            return scripts[0]
+
+    # ============================================
+    # Fallback mecânico: se tudo falhar, transforma outline em cenas básicas
+    # ============================================
+    @staticmethod
+    def _mechanical_from_outline(
+        outline: dict[str, Any], template: TemplateType
+    ) -> Script:
+        """Último recurso: transforma beats crus em cenas sem expansão da IA."""
+        lines: list[ScriptLine] = []
+        beats = outline.get("beats") or []
+        for b in beats:
+            idea = (b.get("idea") or "").strip()
+            if not idea:
+                continue
+            if idea[-1] not in ".!?":
+                idea += "."
+            role = (b.get("role") or "development").lower()
             try:
-                return self._call_gemini(system, user)
-            except Exception as e:
-                logger.warning(f"⚠️ Gemini falhou: {type(e).__name__}: {e}")
-                if self.groq_available:
-                    logger.warning("Tentando Groq como fallback...")
-                else:
-                    raise
+                beat = BeatType(role)
+            except ValueError:
+                beat = BeatType.DEVELOPMENT
+            lines.append(
+                ScriptLine(
+                    text=idea,
+                    scene_type=SceneType.VIDEO_BROLL,
+                    visual_query=idea[:50],
+                    visual_queries=[idea[:50]],
+                    beat_type=beat,
+                )
+            )
+        return Script(
+            title=outline.get("title", "") or "",
+            hashtags=outline.get("hashtags") or [],
+            lines=lines,
+        )
 
-        # Nível 2: Groq
+    # ============================================
+    # Cascata Gemini 2.5 Flash → 2.0 Flash → Groq
+    # ============================================
+    def _call_with_fallback(self, system: str, user: str, max_tokens: int = 4000) -> str:
+        """Tenta os modelos em ordem. Retorna a string bruta."""
+        errors: list[str] = []
+
+        if self.gemini_available:
+            for model_name in (config.gemini_model, "gemini-2.0-flash"):
+                try:
+                    return self._call_gemini(system, user, model_name, max_tokens)
+                except Exception as e:
+                    msg = f"{model_name}: {type(e).__name__}: {e}"
+                    logger.warning(f"⚠️ Gemini {msg}")
+                    errors.append(msg)
+
         if self.groq_available:
-            return self._call_groq(system, user)
+            try:
+                return self._call_groq(system, user, max_tokens)
+            except Exception as e:
+                msg = f"groq: {type(e).__name__}: {e}"
+                logger.warning(f"⚠️ Groq falhou {msg}")
+                errors.append(msg)
 
-        raise RuntimeError("Nenhuma IA disponível pra gerar roteiro")
+        raise RuntimeError(f"Nenhuma IA disponível. Erros: {'; '.join(errors)}")
 
-    # ============================================
-    # Gemini (primário)
-    # ============================================
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=6), reraise=True)
-    def _call_gemini(self, system: str, user: str) -> Script:
-        logger.info("Chamando Gemini...")
-        # Gemini aceita system_instruction + single user message
+    def _call_gemini(self, system: str, user: str, model_name: str, max_tokens: int) -> str:
+        logger.info(f"Chamando {model_name}...")
         model = genai.GenerativeModel(
-            model_name=config.gemini_model,
+            model_name=model_name,
             system_instruction=system,
             generation_config=genai.types.GenerationConfig(
                 temperature=0.85,
-                max_output_tokens=4000,
+                max_output_tokens=max_tokens,
                 response_mime_type="application/json",
             ),
         )
         response = model.generate_content(user)
         raw = response.text or "{}"
-        logger.info(f"Gemini respondeu: {len(raw)} chars")
+        logger.info(f"{model_name} retornou {len(raw)} chars")
+        return raw
 
-        data = self._parse_json(raw)
-        return self._to_script(data)
-
-    # ============================================
-    # Groq (fallback)
-    # ============================================
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=6), reraise=True)
-    def _call_groq(self, system: str, user: str) -> Script:
-        logger.info("Chamando Groq...")
+    def _call_groq(self, system: str, user: str, max_tokens: int) -> str:
+        logger.info(f"Chamando Groq {config.groq_model}...")
         completion = self.groq_client.chat.completions.create(
             model=config.groq_model,
             messages=[
@@ -343,17 +503,15 @@ class ScriptWriter:
                 {"role": "user", "content": user},
             ],
             temperature=0.85,
-            max_tokens=3500,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
         )
         raw = completion.choices[0].message.content or "{}"
-        logger.info(f"Groq respondeu: {len(raw)} chars")
-
-        data = self._parse_json(raw)
-        return self._to_script(data)
+        logger.info(f"Groq retornou {len(raw)} chars")
+        return raw
 
     # ============================================
-    # Parsing compartilhado
+    # Parsing
     # ============================================
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
@@ -366,47 +524,62 @@ class ScriptWriter:
             raise
 
     @staticmethod
-    def _to_script(data: dict[str, Any]) -> Script:
-        lines = []
+    def _to_script(data: dict[str, Any], outline_fallback: dict[str, Any]) -> Script:
+        lines: list[ScriptLine] = []
         for item in data.get("lines", []):
             text = (item.get("text") or "").strip()
             if not text:
                 continue
 
+            # scene_type
             raw_scene = (item.get("scene_type") or "video_broll").strip().lower()
             try:
                 scene_type = SceneType(raw_scene)
             except ValueError:
-                logger.warning(f"scene_type inválido {raw_scene!r} — usando video_broll")
+                logger.warning(f"scene_type inválido {raw_scene!r} → video_broll")
                 scene_type = SceneType.VIDEO_BROLL
+
+            # beat_type
+            raw_beat = (item.get("beat_type") or "development").strip().lower()
+            try:
+                beat_type = BeatType(raw_beat)
+            except ValueError:
+                beat_type = BeatType.DEVELOPMENT
 
             emphasis = item.get("emphasis_words") or []
             if not isinstance(emphasis, list):
                 emphasis = []
 
+            # visual_queries: aceita list (novo) OU string única (backcompat)
+            raw_queries = item.get("visual_queries")
+            if isinstance(raw_queries, list) and raw_queries:
+                queries = [str(q).strip() for q in raw_queries if q]
+            else:
+                single = (item.get("visual_query") or "").strip()
+                queries = [single] if single else []
+
             lines.append(
                 ScriptLine(
                     text=text,
                     scene_type=scene_type,
-                    visual_query=(item.get("visual_query") or "").strip(),
+                    visual_query=queries[0] if queries else "",
+                    visual_queries=queries,
                     person_name=item.get("person_name"),
                     bg_color=item.get("bg_color"),
                     emphasis_words=[str(w) for w in emphasis if w],
+                    beat_type=beat_type,
                 )
             )
 
         if not lines:
-            raise RuntimeError(
-                "IA retornou roteiro vazio/inválido. "
-                "Tente outro tema ou roda de novo."
-            )
+            raise RuntimeError("IA retornou roteiro vazio")
 
-        hashtags = data.get("hashtags") or []
+        hashtags = data.get("hashtags") or outline_fallback.get("hashtags") or []
         if not isinstance(hashtags, list):
             hashtags = []
 
         return Script(
-            title=(data.get("title") or "").strip(),
+            title=(data.get("title") or outline_fallback.get("title") or "").strip(),
             hashtags=[str(h) for h in hashtags if h],
             lines=lines,
         )
