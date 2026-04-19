@@ -49,6 +49,18 @@ class BeatType(str, Enum):
     CTA = "cta"
 
 
+class ImpactLevel(str, Enum):
+    """
+    Nível de impacto visual da legenda, marcado pela IA no roteiro.
+    - low: cena normal (tamanho base)
+    - medium: argumento forte (legenda 20% maior)
+    - high: FRASE BOMBA — billboard gigante no centro (usar 1-2x por vídeo)
+    """
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 class ScriptLine(BaseModel):
     """Uma frase do roteiro com instruções de cena."""
     text: str
@@ -59,6 +71,7 @@ class ScriptLine(BaseModel):
     bg_color: Optional[str] = None  # hex se scene_type == COLOR_BACKGROUND
     emphasis_words: list[str] = Field(default_factory=list)  # palavras pra destacar
     beat_type: BeatType = BeatType.DEVELOPMENT  # papel narrativo (afeta ritmo da narração)
+    impact_level: ImpactLevel = ImpactLevel.LOW  # intensidade visual da legenda (IA marca)
 
 
 class Script(BaseModel):
@@ -94,21 +107,37 @@ class WordTimestamp(BaseModel):
 
     ⚠️ `word` é SEMPRE a palavra LIMPA (sem pontuação). A pontuação que vinha
     anexada fica em `terminator` e é usada pra decidir quebra de legenda.
+
+    `beat_type` é propagado pelo orchestrator depois do alinhamento, pra que
+    o gerador de legendas possa variar posição por beat (hook=centro, climax=topo).
+    Default DEVELOPMENT evita `None` em words que o realign criou sem scene.
     """
     word: str
     start: float  # segundos
     end: float
     is_emphasis: bool = False
     terminator: str = ""  # pontuação que terminava a palavra: "", ".", ",", "!", "?", "...", ";", ":"
+    beat_type: BeatType = BeatType.DEVELOPMENT
+    impact_level: ImpactLevel = ImpactLevel.LOW
 
 
 class Scene(BaseModel):
-    """Uma cena renderizada (com mídia + timing)."""
+    """Uma cena renderizada (com mídia + timing).
+
+    Quando cenas longas são quebradas em sub-clips visuais (pra aumentar ritmo
+    e retenção), os sub-clips COMPARTILHAM a ScriptLine mas têm `clip_index`
+    diferente. Isso permite que o MediaDispatcher busque mídia alternativa
+    (rotacionando `visual_queries`) pra cada sub-clip, evitando repetição
+    visual na mesma frase.
+    """
     script_line: ScriptLine
     start_time: float
     end_time: float
     media_path: Optional[Path] = None  # None se COLOR_BACKGROUND
     words: list[WordTimestamp] = Field(default_factory=list)
+    clip_index: int = 0       # posição do sub-clip dentro da cena original (0,1,2...)
+    clip_total: int = 1       # quantos sub-clips a cena foi dividida
+    flash_intro: bool = False  # flash branco nos primeiros 100ms (pattern interrupt em mudança de beat)
 
     @property
     def duration(self) -> float:

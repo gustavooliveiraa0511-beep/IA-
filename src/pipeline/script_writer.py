@@ -33,6 +33,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.pipeline.models import (
     BeatType,
+    ImpactLevel,
     Script,
     ScriptLine,
     SceneType,
@@ -176,6 +177,15 @@ TAREFA: Expandir o OUTLINE abaixo em roteiro completo de {target_words} palavras
 - "color_background": fundo liso com frase de impacto CENTRAL. Máx 2 vezes no roteiro inteiro.
 - "person_photo": só se citar pessoa famosa específica (preencha `person_name`)
 
+━━━ IMPACT LEVEL (intensidade visual da legenda) ━━━
+Para cada cena, classifique "impact_level":
+- "low": cena normal de desenvolvimento (maioria das cenas)
+- "medium": argumento forte, merece legenda 20% maior
+- "high": FRASE BOMBA / REVELAÇÃO — legenda GIGANTE no centro da tela
+  (MÁXIMO 1-2 cenas no roteiro todo marcadas como "high"). Normalmente é
+  o insight-chave do climax ou a virada que o espectador vai querer printar.
+  Se marcar 4 cenas como "high" perde totalmente o impacto.
+
 ━━━ FORMATO JSON DE SAÍDA ━━━
 {{
   "title": "título curto",
@@ -188,7 +198,8 @@ TAREFA: Expandir o OUTLINE abaixo em roteiro completo de {target_words} palavras
       "person_name": null,
       "bg_color": null,
       "emphasis_words": ["palavra_chave1", "palavra_chave2"],
-      "beat_type": "hook"
+      "beat_type": "hook",
+      "impact_level": "low"
     }}
   ]
 }}
@@ -198,6 +209,7 @@ TAREFA: Expandir o OUTLINE abaixo em roteiro completo de {target_words} palavras
 2. Cada cena de development tem exemplo CONCRETO? (Se não, adicione)
 3. Total ≥ {min_words} palavras? (Se não, expanda)
 4. Pontuação criando ritmo? (pontos = pausa grande, vírgulas = pausa curta)
+5. Máximo 1-2 cenas com impact_level="high" — a revelação principal apenas?
 
 Responda SÓ o JSON."""
 
@@ -592,6 +604,15 @@ class ScriptWriter:
             except ValueError:
                 beat_type = BeatType.DEVELOPMENT
 
+            # impact_level: IA marca intensidade visual da legenda.
+            # Default "low" se omisso (backcompat com outputs LLM antigos).
+            raw_impact = (item.get("impact_level") or "low").strip().lower()
+            try:
+                impact_level = ImpactLevel(raw_impact)
+            except ValueError:
+                logger.warning(f"impact_level inválido {raw_impact!r} → low")
+                impact_level = ImpactLevel.LOW
+
             emphasis = item.get("emphasis_words") or []
             if not isinstance(emphasis, list):
                 emphasis = []
@@ -614,11 +635,26 @@ class ScriptWriter:
                     bg_color=item.get("bg_color"),
                     emphasis_words=[str(w) for w in emphasis if w],
                     beat_type=beat_type,
+                    impact_level=impact_level,
                 )
             )
 
         if not lines:
             raise RuntimeError("IA retornou roteiro vazio")
+
+        # Limita impact_level="high" a no máximo 2 por roteiro. Se LLM exagerou,
+        # rebaixa os excedentes (mantém os 2 primeiros, resto vira "medium").
+        MAX_HIGH_IMPACT = 2
+        high_count = 0
+        for ln in lines:
+            if ln.impact_level == ImpactLevel.HIGH:
+                high_count += 1
+                if high_count > MAX_HIGH_IMPACT:
+                    logger.info(
+                        f"[ScriptWriter] impact_level=high excedente, "
+                        f"rebaixando '{ln.text[:40]}...' → medium"
+                    )
+                    ln.impact_level = ImpactLevel.MEDIUM
 
         hashtags = data.get("hashtags") or outline_fallback.get("hashtags") or []
         if not isinstance(hashtags, list):

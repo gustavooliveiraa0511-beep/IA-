@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -56,23 +57,86 @@ PIPER_CONFIG_URL = (
 # ============================================
 # Rate (velocidade) por papel narrativo (beat_type)
 # O Edge TTS aceita "+X%"/"-X%". Valores negativos = mais devagar.
+#
+# Princípio (pós-ajuste de naturalidade):
+# - Só desacelera onde PRECISA: climax (dramático) e CTA (firme).
+# - Hook e development mantêm ritmo pra não derrubar retenção nos
+#   primeiros segundos.
+# - Climax é empurrado mais fundo (-12%) porque é onde a fala fica
+#   mais "embolada" quando acumula palavras de ênfase.
 # ============================================
 RATE_BY_BEAT: dict[BeatType, str] = {
     BeatType.HOOK: "-3%",          # firme mas levemente mais rápido
     BeatType.DEVELOPMENT: "+0%",   # neutro
-    BeatType.CLIMAX: "-8%",        # dramático, respirando
+    BeatType.CLIMAX: "-12%",       # dramático, respirando mais (era -8%)
     BeatType.CTA: "-5%",           # autoritário
 }
 
 
 # Ajuste extra de velocidade por template (multiplica/soma com o rate de beat)
 # Mantido pra permitir tom diferente entre motivacional e gaming sem mudar beat.
+# Reduzimos os picos de +8%/+12% pra não emboletar a fala em momentos críticos.
 RATE_BY_TEMPLATE: dict[str, int] = {
     "motivacional": -2,   # levemente mais lento (dá peso)
-    "viral": +8,          # mais energia
+    "viral": +5,          # energia, mas sem apressar demais (era +8)
     "noticias": 0,        # neutro
-    "gaming": +12,        # alta energia
+    "gaming": +8,         # alta energia sem emboletar (era +12)
 }
+
+
+# Volume por beat (Edge TTS aceita "+X%"/"-X%"). Como PITCH foi removido no
+# edge-tts 6.0.3, volume é o único outro eixo de prosódia disponível. Simula
+# variação de "tom emocional" — climax sobe volume, pausa abaixa.
+#
+# Valores calibrados: >+25% começa a clipar áudio mesmo com loudnorm no final.
+VOLUME_BY_BEAT: dict[BeatType, str] = {
+    BeatType.HOOK: "+5%",          # presente sem gritar
+    BeatType.DEVELOPMENT: "+0%",   # neutro
+    BeatType.CLIMAX: "+15%",       # pico emocional — SOBE
+    BeatType.CTA: "+8%",           # autoritário
+}
+
+
+# Pontuação que separa palavras/frases (usado pra achar ocorrência de ênfase
+# em qualquer posição da frase, sem distinguir "palavra," de "palavra.").
+_EMPH_STRIP = ".,!?;:…\"')]}>»›"
+
+
+def _inject_emphasis_pause(text: str, emphasis_word: str) -> str:
+    """
+    Insere micro-pausa natural EM TORNO da palavra de ênfase.
+
+    Estratégia: substitui a primeira ocorrência por `"..., <palavra>,"`
+    (ellipsis antes + vírgula depois). Edge TTS interpreta ellipsis como
+    pausa de ~350ms e vírgula como pausa de ~150ms, criando um efeito
+    dramático sem artefato sonoro.
+
+    Retorna o texto modificado (ou original se a palavra não for encontrada).
+
+    ⚠️ Isso altera a narração mas NÃO a legenda — `_realign_with_script_text`
+    no orchestrator sobrescreve o texto da legenda com o roteiro original.
+    """
+    if not emphasis_word or not emphasis_word.strip():
+        return text
+    word = emphasis_word.strip().strip(_EMPH_STRIP)
+    if not word or len(word) < 3:
+        return text
+    # Match palavra inteira (case-insensitive), ignora variantes com acento
+    # que já foram cuidadas no script
+    pattern = re.compile(
+        r"(?<![\wÀ-ÿ])(" + re.escape(word) + r")(?![\wÀ-ÿ])",
+        re.IGNORECASE,
+    )
+    replaced = [False]
+
+    def repl(m: re.Match) -> str:
+        if replaced[0]:
+            return m.group(0)
+        replaced[0] = True
+        return f"... {m.group(1)},"
+
+    new_text = pattern.sub(repl, text, count=1)
+    return new_text if replaced[0] else text
 
 
 def _combine_rate(beat: BeatType, template: str) -> str:
@@ -80,8 +144,13 @@ def _combine_rate(beat: BeatType, template: str) -> str:
     base = int(RATE_BY_BEAT[beat].rstrip("%"))
     bonus = RATE_BY_TEMPLATE.get(template, 0)
     total = base + bonus
-    sign = "+" if total >= 0 else ""
-    return f"{sign}{total}%"
+    return _fmt_pct(total)
+
+
+def _fmt_pct(n: int) -> str:
+    """Formata inteiro como '+X%' ou '-X%' (necessário pro Edge TTS)."""
+    sign = "+" if n >= 0 else ""
+    return f"{sign}{n}%"
 
 
 # Vozes recomendadas por template
@@ -149,56 +218,77 @@ class Narrator:
 
         try:
             for g_idx, (beat, lines) in enumerate(groups):
-                text = self._group_text(lines)
-                part_path = tmp_dir / f"grp_{g_idx:02d}.mp3"
-                rate = _combine_rate(beat, template)
+                base_rate = _combine_rate(beat, template)
+                base_volume = VOLUME_BY_BEAT.get(beat, "+0%")
 
-                # Tenta Edge TTS com WordBoundary
-                words_in_part: list[WordTimestamp] = []
-                edge_ok = False
-                try:
-                    words_in_part = self._edge_narrate_with_boundaries(
-                        text, part_path, rate=rate
+                # Em CLIMAX/CTA com MÚLTIPLAS linhas, narra linha-a-linha
+                # alternando rate/volume pra simular contorno emocional
+                # (sobe-desce-sobe). Em hook/dev, mantém agrupado pra fluxo.
+                if beat in (BeatType.CLIMAX, BeatType.CTA) and len(lines) > 1:
+                    sub_narrations = self._climax_variations(
+                        lines, base_rate=base_rate, base_volume=base_volume
                     )
-                    edge_ok = True
-                    any_edge_success = True
-                    logger.info(
-                        f"[Narrator] grp {g_idx} ({beat.value}, {rate}): Edge ✅ "
-                        f"{len(words_in_part)} palavras"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"[Narrator] Edge falhou no grp {g_idx}: {type(e).__name__}: {e}"
-                    )
+                else:
+                    # Chamada única tradicional
+                    text = self._group_text(lines)
+                    sub_narrations = [(text, base_rate, base_volume)]
 
-                # Fallback pra Piper / gTTS (sem WordBoundary — Whisper depois)
-                if not edge_ok:
+                for v_idx, (sub_text, sub_rate, sub_vol) in enumerate(sub_narrations):
+                    part_path = tmp_dir / f"grp_{g_idx:02d}_{v_idx:02d}.mp3"
+
+                    # Tenta Edge TTS com WordBoundary
+                    words_in_part: list[WordTimestamp] = []
+                    edge_ok = False
                     try:
-                        self._piper_narrate(text, part_path)
-                        logger.info(f"[Narrator] grp {g_idx}: Piper ✅ (sem boundaries)")
+                        words_in_part = self._edge_narrate_with_boundaries(
+                            sub_text, part_path, rate=sub_rate, volume=sub_vol
+                        )
+                        edge_ok = True
+                        any_edge_success = True
+                        logger.info(
+                            f"[Narrator] grp {g_idx}.{v_idx} ({beat.value}, "
+                            f"rate={sub_rate}, vol={sub_vol}): Edge ✅ "
+                            f"{len(words_in_part)} palavras"
+                        )
                     except Exception as e:
                         logger.warning(
-                            f"[Narrator] Piper falhou no grp {g_idx}: {type(e).__name__}"
+                            f"[Narrator] Edge falhou no grp {g_idx}.{v_idx}: "
+                            f"{type(e).__name__}: {e}"
                         )
-                        self._gtts_narrate(text, part_path)
-                        logger.info(f"[Narrator] grp {g_idx}: gTTS ✅ (último recurso)")
 
-                parts.append(part_path)
+                    # Fallback pra Piper / gTTS (sem WordBoundary — Whisper depois)
+                    if not edge_ok:
+                        try:
+                            self._piper_narrate(sub_text, part_path)
+                            logger.info(
+                                f"[Narrator] grp {g_idx}.{v_idx}: Piper ✅ (sem boundaries)"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[Narrator] Piper falhou no grp {g_idx}.{v_idx}: "
+                                f"{type(e).__name__}"
+                            )
+                            self._gtts_narrate(sub_text, part_path)
+                            logger.info(
+                                f"[Narrator] grp {g_idx}.{v_idx}: gTTS ✅ (último recurso)"
+                            )
 
-                # Ajusta offsets das words desse grupo pro tempo acumulado
-                for w in words_in_part:
-                    all_words.append(
-                        WordTimestamp(
-                            word=w.word,
-                            start=w.start + cumulative_offset,
-                            end=w.end + cumulative_offset,
-                            terminator=w.terminator,
+                    parts.append(part_path)
+
+                    # Ajusta offsets das words desse sub-trecho pro tempo acumulado
+                    for w in words_in_part:
+                        all_words.append(
+                            WordTimestamp(
+                                word=w.word,
+                                start=w.start + cumulative_offset,
+                                end=w.end + cumulative_offset,
+                                terminator=w.terminator,
+                            )
                         )
-                    )
 
-                # Descobre duração real do mp3 pra atualizar o offset
-                part_duration = _probe_duration(part_path)
-                cumulative_offset += part_duration
+                    # Descobre duração real do mp3 pra atualizar o offset
+                    part_duration = _probe_duration(part_path)
+                    cumulative_offset += part_duration
 
             # Concatena os mp3s em um único arquivo (sem gap entre grupos — fluxo contínuo)
             self._concat(parts, output_path)
@@ -247,23 +337,83 @@ class Narrator:
 
     @staticmethod
     def _group_text(lines: list[ScriptLine]) -> str:
-        """Junta o texto das linhas do grupo garantindo pontuação final."""
+        """
+        Junta o texto das linhas do grupo garantindo pontuação final.
+
+        Em CLIMAX e CTA, injeta micro-pausas nas palavras de ênfase pra que
+        o Edge TTS respire antes delas (ellipsis) e depois (vírgula). Isso
+        desembola a fala nos momentos mais carregados de emoção sem precisar
+        desacelerar o grupo inteiro.
+        """
         parts: list[str] = []
         for line in lines:
             t = line.text.strip()
             if not t:
                 continue
+            # Só nos momentos críticos (climax/cta) e quando há ênfase marcada
+            if line.emphasis_words and line.beat_type in (BeatType.CLIMAX, BeatType.CTA):
+                for emph in line.emphasis_words:
+                    t = _inject_emphasis_pause(t, emph)
             if t[-1] not in ".!?…":
                 t += "."
             parts.append(t)
         return " ".join(parts)
+
+    @staticmethod
+    def _climax_variations(
+        lines: list[ScriptLine],
+        base_rate: str,
+        base_volume: str,
+    ) -> list[tuple[str, str, str]]:
+        """
+        Produz variações (texto, rate, volume) POR LINHA num grupo de
+        CLIMAX/CTA, alternando intensidade pra criar contorno emocional:
+        sobe-desce-sobe. Simula variação de "tom" já que Edge TTS não
+        suporta mais pitch.
+
+        Padrão cíclico:
+          linha 0: rate mais lento + volume mais alto   (pico emocional)
+          linha 1: rate intermediário + volume médio    (alívio)
+          linha 2: rate lento + volume alto             (subida final)
+
+        Os deltas são aplicados EM CIMA de base_rate/base_volume do beat,
+        então o efeito respeita a configuração do template.
+        """
+        # Deltas (rate%, volume%) por posição no ciclo
+        deltas = [
+            (-3, +5),   # pico inicial: mais lento + mais alto
+            (+5, -5),   # alívio: mais rápido + um pouco mais baixo
+            (-1, +3),   # subida: levemente mais lento + um pouco mais alto
+        ]
+        out: list[tuple[str, str, str]] = []
+        base_r = int(base_rate.rstrip("%"))
+        base_v = int(base_volume.rstrip("%"))
+        for i, line in enumerate(lines):
+            dr, dv = deltas[i % len(deltas)]
+            rate = _fmt_pct(base_r + dr)
+            volume = _fmt_pct(base_v + dv)
+
+            t = line.text.strip()
+            if not t:
+                continue
+            if line.emphasis_words:
+                for emph in line.emphasis_words:
+                    t = _inject_emphasis_pause(t, emph)
+            if t[-1] not in ".!?…":
+                t += "."
+            out.append((t, rate, volume))
+        return out
 
     # ============================================
     # Edge TTS com stream WordBoundary
     # ============================================
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=6), reraise=True)
     def _edge_narrate_with_boundaries(
-        self, text: str, output_path: Path, rate: str = "+0%"
+        self,
+        text: str,
+        output_path: Path,
+        rate: str = "+0%",
+        volume: str = "+0%",
     ) -> list[WordTimestamp]:
         """
         Gera áudio via Edge TTS e coleta eventos WordBoundary do stream.
@@ -275,9 +425,11 @@ class Narrator:
 
         Retorna lista de WordTimestamp com `terminator=""` (Edge não anexa
         pontuação no text do evento).
+
+        volume: "+X%"/"-X%" passado direto pro prosody SSML interno do edge-tts.
         """
         audio_chunks, words = _run_async_safely(
-            self._edge_stream_async(text, rate)
+            self._edge_stream_async(text, rate, volume)
         )
         if not audio_chunks:
             raise RuntimeError("Edge TTS não retornou áudio")
@@ -292,9 +444,11 @@ class Narrator:
         return words
 
     async def _edge_stream_async(
-        self, text: str, rate: str
+        self, text: str, rate: str, volume: str = "+0%"
     ) -> tuple[list[bytes], list[WordTimestamp]]:
-        communicate = edge_tts.Communicate(text=text, voice=self.voice, rate=rate)
+        communicate = edge_tts.Communicate(
+            text=text, voice=self.voice, rate=rate, volume=volume
+        )
         audio_chunks: list[bytes] = []
         words: list[WordTimestamp] = []
         async for chunk in communicate.stream():

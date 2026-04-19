@@ -55,14 +55,19 @@ class PexelsFetcher:
         orientation: str = "portrait",
         min_duration: int = 3,
         max_duration: int = 30,
+        variation_index: Optional[int] = None,
     ) -> Optional[Path]:
         """
         Busca vídeo curto no Pexels e baixa.
         Retorna Path local ou None se não encontrar/falhar.
+
+        Se `variation_index` for passado, seleciona o N-ésimo resultado
+        (determinístico). Caso contrário escolhe random. Útil pra sub-clips
+        da mesma cena pegarem mídias diferentes.
         """
         try:
             return self._search_video_with_retry(
-                query, orientation, min_duration, max_duration
+                query, orientation, min_duration, max_duration, variation_index
             )
         except Exception as e:
             logger.warning(f"Pexels search falhou pra {query!r}: {e}")
@@ -75,8 +80,9 @@ class PexelsFetcher:
         orientation: str,
         min_duration: int,
         max_duration: int,
+        variation_index: Optional[int] = None,
     ) -> Optional[Path]:
-        logger.info(f"Pexels: buscando {query!r}")
+        logger.info(f"Pexels: buscando {query!r} (var={variation_index})")
         headers = {"Authorization": self.api_key}
         params = {
             "query": query,
@@ -100,7 +106,12 @@ class PexelsFetcher:
             logger.warning(f"Pexels: nada encontrado para {query!r}")
             return None
 
-        chosen = random.choice(candidates[:5])
+        # Pool dos top 8 (mais variedade que top 5 pra sub-clips).
+        pool_cands = candidates[:8]
+        if variation_index is not None and pool_cands:
+            chosen = pool_cands[variation_index % len(pool_cands)]
+        else:
+            chosen = random.choice(pool_cands[:5])
         chosen_id = chosen.get("id")
         if not chosen_id:
             return None
@@ -140,16 +151,26 @@ class PixabayFetcher:
         if not self.api_key:
             raise ValueError("PIXABAY_API_KEY não configurado")
 
-    def search_image(self, query: str, orientation: str = "vertical") -> Optional[Path]:
+    def search_image(
+        self,
+        query: str,
+        orientation: str = "vertical",
+        variation_index: Optional[int] = None,
+    ) -> Optional[Path]:
         try:
-            return self._search_image_retry(query, orientation)
+            return self._search_image_retry(query, orientation, variation_index)
         except Exception as e:
             logger.warning(f"Pixabay image falhou pra {query!r}: {e}")
             return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8), reraise=True)
-    def _search_image_retry(self, query: str, orientation: str) -> Optional[Path]:
-        logger.info(f"Pixabay: buscando imagem {query!r}")
+    def _search_image_retry(
+        self,
+        query: str,
+        orientation: str,
+        variation_index: Optional[int] = None,
+    ) -> Optional[Path]:
+        logger.info(f"Pixabay: buscando imagem {query!r} (var={variation_index})")
         params = {
             "key": self.api_key,
             "q": query,
@@ -166,7 +187,11 @@ class PixabayFetcher:
             logger.warning(f"Pixabay: sem imagens pra {query!r}")
             return None
 
-        chosen = random.choice(hits[:10])
+        pool_cands = hits[:15]
+        if variation_index is not None and pool_cands:
+            chosen = pool_cands[variation_index % len(pool_cands)]
+        else:
+            chosen = random.choice(pool_cands[:10])
         chosen_id = chosen.get("id")
         url = chosen.get("largeImageURL") or chosen.get("webformatURL")
         if not url or not chosen_id:
@@ -176,16 +201,20 @@ class PixabayFetcher:
             return cache
         return _download(url, cache)
 
-    def search_video(self, query: str) -> Optional[Path]:
+    def search_video(
+        self, query: str, variation_index: Optional[int] = None
+    ) -> Optional[Path]:
         try:
-            return self._search_video_retry(query)
+            return self._search_video_retry(query, variation_index)
         except Exception as e:
             logger.warning(f"Pixabay video falhou pra {query!r}: {e}")
             return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8), reraise=True)
-    def _search_video_retry(self, query: str) -> Optional[Path]:
-        logger.info(f"Pixabay: buscando vídeo {query!r}")
+    def _search_video_retry(
+        self, query: str, variation_index: Optional[int] = None
+    ) -> Optional[Path]:
+        logger.info(f"Pixabay: buscando vídeo {query!r} (var={variation_index})")
         params = {
             "key": self.api_key,
             "q": query,
@@ -197,7 +226,11 @@ class PixabayFetcher:
         hits = data.get("hits") or []
         if not hits:
             return None
-        chosen = random.choice(hits[:5])
+        pool_cands = hits[:8]
+        if variation_index is not None and pool_cands:
+            chosen = pool_cands[variation_index % len(pool_cands)]
+        else:
+            chosen = random.choice(pool_cands[:5])
         chosen_id = chosen.get("id")
         videos = chosen.get("videos") or {}
         if not chosen_id:
@@ -288,46 +321,57 @@ class MediaDispatcher:
         self._used_video_paths.clear()
         self._used_image_paths.clear()
 
-    def fetch_video(self, queries: str | list[str]) -> Optional[Path]:
+    def fetch_video(
+        self,
+        queries: str | list[str],
+        variation_index: Optional[int] = None,
+    ) -> Optional[Path]:
         """
         Tenta cada query em ordem até achar vídeo. Primeira query deve ser a
         mais genérica (mais resultados), últimas mais específicas.
         Pexels primeiro (qualidade melhor), cai pra Pixabay.
+
+        Se `variation_index` for passado, seleciona resultado determinístico
+        pra sub-clips pegarem mídias diferentes (em vez de random).
         """
         for q in _as_list(queries):
             if self.pexels:
-                result = self.pexels.search_video(q)
+                result = self.pexels.search_video(q, variation_index=variation_index)
                 if result and self._is_fresh(result, self._used_video_paths):
                     self._used_video_paths.add(str(result))
                     return result
             if self.pixabay:
-                result = self.pixabay.search_video(q)
+                result = self.pixabay.search_video(q, variation_index=variation_index)
                 if result and self._is_fresh(result, self._used_video_paths):
                     self._used_video_paths.add(str(result))
                     return result
         # Se nenhuma query deu mídia fresca, aceita até repetida
         for q in _as_list(queries):
             if self.pexels:
-                r = self.pexels.search_video(q)
+                r = self.pexels.search_video(q, variation_index=variation_index)
                 if r:
                     return r
             if self.pixabay:
-                r = self.pixabay.search_video(q)
+                r = self.pixabay.search_video(q, variation_index=variation_index)
                 if r:
                     return r
         return None
 
-    def fetch_image(self, queries: str | list[str]) -> Optional[Path]:
+    def fetch_image(
+        self,
+        queries: str | list[str],
+        variation_index: Optional[int] = None,
+    ) -> Optional[Path]:
         if not self.pixabay:
             return None
         for q in _as_list(queries):
-            result = self.pixabay.search_image(q)
+            result = self.pixabay.search_image(q, variation_index=variation_index)
             if result and self._is_fresh(result, self._used_image_paths):
                 self._used_image_paths.add(str(result))
                 return result
         # Aceita repetida
         for q in _as_list(queries):
-            r = self.pixabay.search_image(q)
+            r = self.pixabay.search_image(q, variation_index=variation_index)
             if r:
                 return r
         return None
