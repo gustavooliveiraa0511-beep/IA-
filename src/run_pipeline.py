@@ -11,13 +11,13 @@ Fluxo:
 1. Roda o PipelineOrchestrator
 2. Upload pro Cloudflare R2
 3. Manda mensagem no Telegram com o link do vídeo
+
+Mantido 100% SYNC pra evitar conflito com event loop do Edge TTS.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
-from pathlib import Path
 
 from src.bot.notifier import send_text, send_video_file, send_video_url
 from src.pipeline.models import TemplateType, VideoRequest
@@ -29,7 +29,7 @@ from src.utils.storage import R2Uploader
 logger = get_logger(__name__)
 
 
-async def main() -> int:
+def main() -> int:
     theme = os.getenv("THEME", "").strip()
     template = os.getenv("TEMPLATE", "motivacional").strip().lower()
     voice = os.getenv("VOICE", "pt-BR-AntonioNeural").strip()
@@ -47,7 +47,7 @@ async def main() -> int:
 
     # Aviso inicial
     if chat_id:
-        await send_text(
+        send_text(
             chat_id,
             f"🎬 Iniciando geração: *{theme}*\n"
             f"Template: `{template}` | Voz: `{voice}`",
@@ -59,7 +59,7 @@ async def main() -> int:
         msg = f"❌ Configs faltando: {', '.join(missing)}"
         logger.error(msg)
         if chat_id:
-            await send_text(chat_id, msg)
+            send_text(chat_id, msg)
         return 3
 
     request = VideoRequest(
@@ -74,12 +74,12 @@ async def main() -> int:
     except Exception as e:
         logger.exception("pipeline falhou")
         if chat_id:
-            await send_text(chat_id, f"❌ Erro na geração:\n`{type(e).__name__}: {e}`")
+            send_text(chat_id, f"❌ Erro na geração:\n`{type(e).__name__}: {e}`")
         return 1
 
     if not job.final_video_path or not job.final_video_path.exists():
         if chat_id:
-            await send_text(chat_id, "❌ Vídeo final não foi gerado.")
+            send_text(chat_id, "❌ Vídeo final não foi gerado.")
         return 1
 
     # Upload R2 (se configurado) ou envia direto
@@ -98,12 +98,18 @@ async def main() -> int:
 
     if chat_id:
         if video_url:
-            ok = await send_video_url(chat_id, video_url, caption)
+            ok = send_video_url(chat_id, video_url, caption)
             if not ok:
-                await send_video_file(chat_id, job.final_video_path, caption)
+                send_video_file(chat_id, job.final_video_path, caption)
         else:
             # Sem R2: sobe o arquivo direto (até 50MB)
-            await send_video_file(chat_id, job.final_video_path, caption)
+            ok = send_video_file(chat_id, job.final_video_path, caption)
+            if not ok:
+                send_text(
+                    chat_id,
+                    "⚠️ Vídeo gerado mas é grande demais pro Telegram direto.\n"
+                    "Configure o Cloudflare R2 nos secrets pra receber link.",
+                )
 
     return 0
 
@@ -119,4 +125,4 @@ def _build_caption(job) -> str:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())

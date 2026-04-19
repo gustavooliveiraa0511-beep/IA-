@@ -9,6 +9,7 @@ Vozes PT-BR recomendadas:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from pathlib import Path
 
 import edge_tts
@@ -17,6 +18,23 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _run_async_safely(coro):
+    """
+    Roda uma coroutine funcionando em qualquer contexto:
+    - Se não há event loop: usa asyncio.run normal
+    - Se já há event loop rodando: roda em thread separada pra não conflitar
+    """
+    try:
+        asyncio.get_running_loop()
+        # Já estamos num event loop — roda em thread separada
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
+    except RuntimeError:
+        # Sem event loop ativo — asyncio.run funciona
+        return asyncio.run(coro)
 
 
 class Narrator:
@@ -34,7 +52,7 @@ class Narrator:
         logger.info(f"Narrando {len(text)} chars com voz {self.voice}")
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        asyncio.run(self._generate_async(text, output_path, rate, pitch))
+        _run_async_safely(self._generate_async(text, output_path, rate, pitch))
 
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError("Edge TTS não gerou áudio")
@@ -52,10 +70,12 @@ class Narrator:
         await communicate.save(str(output_path))
 
     @staticmethod
-    async def list_brazilian_voices() -> list[dict]:
+    def list_brazilian_voices() -> list[dict]:
         """Lista vozes brasileiras disponíveis."""
-        voices = await edge_tts.list_voices()
-        return [v for v in voices if v["Locale"].startswith("pt-BR")]
+        async def _list():
+            voices = await edge_tts.list_voices()
+            return [v for v in voices if v["Locale"].startswith("pt-BR")]
+        return _run_async_safely(_list())
 
 
 # Voz recomendada por template
