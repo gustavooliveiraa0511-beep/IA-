@@ -91,19 +91,25 @@ async def _reject_if_unauthorized(update: Update) -> bool:
 # ============================================
 # Disparador de GitHub Actions
 # ============================================
-async def _dispatch_github_action(inputs: dict) -> bool:
+# Inputs "legados" — sempre aceitos pelo workflow antigo
+_CORE_INPUTS = {"theme", "template", "voice", "chat_id"}
+
+
+async def _dispatch_github_action(inputs: dict) -> tuple[bool, str]:
     """
     Dispara o workflow 'generate-video.yml' no GitHub com os inputs.
 
-    O workflow:
-    - Instala deps
-    - Roda o pipeline
-    - Sobe no R2
-    - Chama de volta o bot via webhook/API pra entregar o vídeo
+    Retorna (sucesso, mensagem). A mensagem é descritiva do motivo da falha
+    pra exibir ao usuário no Telegram.
+
+    Resiliência: se o GitHub retornar 422 "Unexpected inputs provided"
+    (workflow ainda tá na versão antiga sem quality_mode/duration), faz
+    retry automático apenas com os inputs básicos.
     """
-    if not (config.github_token and config.github_repo):
-        logger.error("GITHUB_TOKEN/REPO não configurados — impossível disparar workflow")
-        return False
+    if not config.github_token:
+        return False, "GITHUB_TOKEN não configurado nos secrets do repositório."
+    if not config.github_repo:
+        return False, "GITHUB_REPO não configurado."
 
     url = f"https://api.github.com/repos/{config.github_repo}/actions/workflows/generate-video.yml/dispatches"
     headers = {
@@ -111,18 +117,70 @@ async def _dispatch_github_action(inputs: dict) -> bool:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    payload = {
-        "ref": "main",
-        "inputs": inputs,
-    }
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        if r.status_code not in (200, 204):
-            logger.error(f"Falha ao disparar Action: {r.status_code} {r.text}")
-            return False
-    logger.info("GitHub Action disparada ✅")
-    return True
+    # Primeira tentativa: com todos os inputs
+    ok, err = await _post_dispatch(url, headers, inputs)
+    if ok:
+        return True, ""
+
+    # Se a falha foi por inputs extras (422 com mensagem sobre "Unexpected inputs"),
+    # retenta só com os básicos. Acontece quando o workflow no main ainda não
+    # foi atualizado pra aceitar quality_mode e duration.
+    if "unexpected inputs" in err.lower() or "inputs provided" in err.lower():
+        core_only = {k: v for k, v in inputs.items() if k in _CORE_INPUTS}
+        logger.warning(
+            "Workflow não aceita inputs extras — retentando com "
+            f"apenas {list(core_only.keys())}"
+        )
+        ok2, err2 = await _post_dispatch(url, headers, core_only)
+        if ok2:
+            return True, (
+                "⚠️ Gerado SEM /premium e /duracao porque o workflow ainda "
+                "está desatualizado. Atualize o arquivo do workflow pra "
+                "ativar esses comandos."
+            )
+        return False, err2
+
+    return False, err
+
+
+async def _post_dispatch(url: str, headers: dict, inputs: dict) -> tuple[bool, str]:
+    """Faz um POST de workflow_dispatch. Retorna (ok, msg_erro)."""
+    payload = {"ref": "main", "inputs": inputs}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(url, headers=headers, json=payload)
+    except httpx.RequestError as e:
+        return False, f"Erro de rede chamando GitHub: {e}"
+
+    if r.status_code in (200, 204):
+        logger.info(f"GitHub Action disparada ✅ (inputs: {list(inputs.keys())})")
+        return True, ""
+
+    # Erro — loga completo e retorna mensagem curta ao usuário
+    body = r.text[:500]
+    logger.error(f"Falha ao disparar Action: {r.status_code} {body}")
+
+    # Mensagens amigáveis por código
+    if r.status_code == 401:
+        return False, (
+            "GITHUB_TOKEN inválido ou expirado. Regenera em "
+            "github.com/settings/tokens e atualiza o secret."
+        )
+    if r.status_code == 403:
+        return False, (
+            "GITHUB_TOKEN sem permissão de 'actions:write'. "
+            "Regenera o token marcando a permissão correta."
+        )
+    if r.status_code == 404:
+        return False, (
+            f"Workflow 'generate-video.yml' não encontrado no repo "
+            f"'{config.github_repo}'. Verifica GITHUB_REPO."
+        )
+    if r.status_code == 422:
+        return False, f"GitHub rejeitou inputs: {body}"
+
+    return False, f"HTTP {r.status_code}: {body[:200]}"
 
 
 # ============================================
@@ -301,20 +359,23 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "duration": str(prefs.get("duration", 45)),
     }
 
-    ok = await _dispatch_github_action(inputs)
+    ok, msg = await _dispatch_github_action(inputs)
     if ok:
         quality_tag = " ✨ PREMIUM" if inputs["quality_mode"] == "premium" else ""
-        await update.message.reply_text(
+        reply = (
             f"🎬 Vídeo em produção!\n"
             f"Tema: *{theme}*\n"
             f"Template: `{prefs['template']}` | Voz: `{prefs['voice']}`\n"
             f"Duração: {inputs['duration']}s{quality_tag}\n\n"
-            f"Leva cerca de 3-7 min. Te mando quando ficar pronto 🚀",
-            parse_mode="Markdown",
+            f"Leva cerca de 3-7 min. Te mando quando ficar pronto 🚀"
         )
+        if msg:
+            reply += f"\n\n{msg}"
+        await update.message.reply_text(reply, parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            "❌ Falha ao iniciar geração. Cheque os secrets no GitHub."
+            f"❌ Falha ao iniciar geração.\n\n*Motivo:* {msg}",
+            parse_mode="Markdown",
         )
 
 
