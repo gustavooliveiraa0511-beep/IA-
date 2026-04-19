@@ -5,7 +5,10 @@ python-telegram-bot==21.6
 groq==0.11.0
 
 # === IA: narração ===
-edge-tts==6.1.19
+# Edge TTS é primário (vozes brasileiras excelentes).
+# Se Microsoft bloquear (403 em IPs de cloud), cai pro gTTS (Google).
+edge-tts>=7.0.0
+gTTS==2.5.3
 
 # === IA: transcrição (timestamp por palavra) ===
 # Usamos SÓ faster-whisper (mais rápido, vem com wheels pré-compilados).
