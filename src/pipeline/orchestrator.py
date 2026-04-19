@@ -19,6 +19,7 @@ Fluxo (versão V2 — pós-reforma de qualidade):
 from __future__ import annotations
 
 import difflib
+import math
 import re
 import shutil
 import uuid
@@ -38,12 +39,22 @@ from src.pipeline.models import (
 )
 from src.pipeline.narrator import Narrator, VOICE_BY_TEMPLATE
 from src.pipeline.script_writer import ScriptWriter
-from src.pipeline.transcriber import Transcriber
+from src.pipeline.transcriber import Transcriber, _clean_word
 from src.utils.config import config, OUTPUT_DIR, TEMP_DIR, ensure_dirs
 from src.utils.logger import get_logger
 from src.utils.music import fetch_music
 
 logger = get_logger(__name__)
+
+
+# Retenção em TikTok/Reels 2026 + feedback do usuário: cortes a cada ~1s geram
+# sensação de vídeo viral (estilo Submagic/CapCut extremo). Dividimos cenas
+# longas em sub-clips visuais de no máximo MAX_CLIP_DURATION segundos — a
+# narração continua contínua, só o visual muda.
+MAX_CLIP_DURATION = 1.0
+# Split mínimo: evita gerar sub-clips tão curtos que a busca de mídia vira
+# inútil (clipe de 0.3s não dá tempo nem de perceber a imagem).
+MIN_SPLIT_DURATION = 0.5
 
 
 class PipelineOrchestrator:
@@ -117,6 +128,13 @@ class PipelineOrchestrator:
                     "Tente outro tema ou verifique o áudio da narração."
                 )
 
+            # CRÍTICO: sobrescreve o texto transcrito pelo texto ORIGINAL do roteiro.
+            # Edge WordBoundary geralmente traz o texto correto (pois o TTS recebeu
+            # o texto bruto), mas Whisper comete erros em nomes próprios (ex: "Kobe
+            # Bryant" → "Cobi Brián"). Ao reescrever com o roteiro, a legenda vira
+            # o source-of-truth e os timestamps continuam vindo do áudio real.
+            words = self._realign_with_script_text(words, job.script)
+
             # Marca palavras de ênfase (union de todas as cenas)
             all_emphasis: list[str] = []
             for line in job.script.lines:
@@ -129,6 +147,36 @@ class PipelineOrchestrator:
             job.scenes = self._align_words_to_scenes(job.script, words)
             if not job.scenes:
                 raise RuntimeError("Nenhuma cena gerada após alinhamento")
+
+            # Propaga beat_type + impact_level para cada word da cena
+            # (captions usa pra variar posição, tamanho e estilo "billboard").
+            for sc in job.scenes:
+                for w in sc.words:
+                    w.beat_type = sc.script_line.beat_type
+                    w.impact_level = sc.script_line.impact_level
+
+            # ==========================================
+            # 4b. Split cenas longas em sub-clips (ritmo + retenção)
+            #
+            # Cenas com duração > MAX_CLIP_DURATION são divididas visualmente:
+            # a narração continua inteira, mas aparecem mídias DIFERENTES em
+            # cada sub-clip. Isso mantém os cortes a cada ~2s, que é o ritmo
+            # comprovado de maior retenção em TikTok/Reels (2026).
+            # ==========================================
+            job.scenes = self._split_long_scenes(job.scenes)
+            logger.info(
+                f"[{job.job_id}] Após split: {len(job.scenes)} clipes visuais "
+                f"(max {MAX_CLIP_DURATION}s cada)"
+            )
+
+            # ==========================================
+            # 4c. Pattern interrupt: flash branco no primeiro clip após
+            # mudança de beat_type. Pesquisa 2026 mostra que pattern
+            # interrupts a cada 30-60s em momentos narrativos-chave
+            # aumentam retenção significativamente. Limitado a 3 flashes
+            # por vídeo pra não virar desconfortável.
+            # ==========================================
+            self._mark_beat_change_flashes(job.scenes, max_flashes=3)
 
             # ==========================================
             # 5+6. Busca mídia e prepara clipes 9:16
@@ -190,6 +238,216 @@ class PipelineOrchestrator:
             raise
 
         return job
+
+    # ============================================
+    # Marca flashes em mudanças de beat (pattern interrupt)
+    # ============================================
+    @staticmethod
+    def _mark_beat_change_flashes(scenes: list[Scene], max_flashes: int = 3) -> None:
+        """
+        Marca com flash_intro=True a PRIMEIRA cena após uma mudança de
+        beat_type (hook→development, development→climax, climax→cta).
+
+        Limita a `max_flashes` flashes no vídeo todo (ordem cronológica)
+        pra não ficar irritante. Nunca marca a cena 0 (ninguém precisa de
+        flash no segundo zero).
+        """
+        if len(scenes) < 2:
+            return
+        flashed = 0
+        prev_beat = scenes[0].script_line.beat_type
+        for i in range(1, len(scenes)):
+            curr_beat = scenes[i].script_line.beat_type
+            if curr_beat != prev_beat:
+                # Mudança de beat: marca primeira cena do novo beat
+                scenes[i].flash_intro = True
+                flashed += 1
+                prev_beat = curr_beat
+                if flashed >= max_flashes:
+                    return
+
+    # ============================================
+    # Split de cenas longas: aumenta ritmo de cortes visuais
+    # ============================================
+    @staticmethod
+    def _split_long_scenes(scenes: list[Scene]) -> list[Scene]:
+        """
+        Divide cenas > MAX_CLIP_DURATION em sub-clips visuais.
+
+        Cada sub-clip compartilha a ScriptLine original (mesma narração, mesmo
+        beat, mesma ênfase), mas recebe `clip_index` diferente para que o
+        MediaDispatcher busque mídia alternativa em `visual_queries`.
+
+        Os timestamps de palavras são redistribuídos por sub-clip: cada word
+        cai no sub-clip cujo intervalo [start, end) a contém. Se uma word
+        cai exatamente na fronteira, fica no primeiro sub-clip.
+
+        ⚠️ A narração/áudio NÃO é recortada — o ffmpeg prepara cada sub-clip
+        com a sua duração, e o final assembly sobrepõe a narração original
+        inteira (que é contínua). Apenas o vídeo tem cortes extras.
+        """
+        new_scenes: list[Scene] = []
+        for sc in scenes:
+            # Sem tolerância: qualquer cena >= MAX_CLIP_DURATION é dividida.
+            # Estudos de retenção mostram que mesmo clipes de 1.2s parecem
+            # "parados" num feed de TikTok. Melhor dividir logo.
+            if sc.duration < MAX_CLIP_DURATION:
+                new_scenes.append(sc)
+                continue
+
+            # Alvo: ceil(duration / MAX) pra garantir que nenhum sub-clip
+            # fique > MAX. Ex: 2.5s com MAX=1.0 → 3 splits de 0.83s cada
+            # (se usasse round daria 2 splits de 1.25s, acima do limite).
+            # Mas se ficaria muito picotado (< MIN_SPLIT_DURATION),
+            # reduz o número de splits.
+            n_splits = max(2, math.ceil(sc.duration / MAX_CLIP_DURATION))
+            while n_splits > 2 and (sc.duration / n_splits) < MIN_SPLIT_DURATION:
+                n_splits -= 1
+            split_dur = sc.duration / n_splits
+
+            for k in range(n_splits):
+                start = sc.start_time + k * split_dur
+                end = (
+                    sc.start_time + (k + 1) * split_dur
+                    if k < n_splits - 1
+                    else sc.end_time
+                )
+                # Palavras que começam dentro do intervalo [start, end)
+                split_words = [w for w in sc.words if start <= w.start < end]
+                new_scenes.append(Scene(
+                    script_line=sc.script_line,
+                    start_time=start,
+                    end_time=end,
+                    words=split_words,
+                    clip_index=k,
+                    clip_total=n_splits,
+                ))
+        return new_scenes
+
+    # ============================================
+    # Realinhamento: substitui texto transcrito pelo texto original do roteiro
+    # ============================================
+    @staticmethod
+    def _realign_with_script_text(
+        words: list[WordTimestamp],
+        script: Script,
+    ) -> list[WordTimestamp]:
+        """
+        Reescreve o campo `.word` de cada WordTimestamp usando a sequência
+        ORIGINAL do roteiro, mantendo os timestamps vindos do áudio.
+
+        Garante que nomes difíceis (ex: "Kobe Bryant", "Schwarzenegger",
+        "Einstein") apareçam na legenda EXATAMENTE como escritos no roteiro,
+        mesmo que Whisper tenha ouvido algo diferente ou Edge TTS tenha
+        pronunciado de forma estranha.
+
+        Estratégia: difflib.SequenceMatcher sobre versões normalizadas
+        (lowercase, sem pontuação, sem acentos) encontra blocos de match.
+        Para cada bloco:
+          - "equal" → usa timestamp do áudio + texto canônico do roteiro.
+          - "replace" → mapeia proporcionalmente dentro do intervalo.
+          - "insert" (roteiro tem palavras que o áudio pulou) → insere com
+            timestamps curtos interpolados.
+          - "delete" (áudio tem palavras extras) → descarta (lixo TTS).
+
+        Fallback: se o ratio global for < 0.4, mantém a lista original
+        (divergência grande demais, provavelmente erro no roteiro).
+        """
+        if not words or not script.lines:
+            return words
+
+        # 1. Extrai tokens canônicos do roteiro
+        script_tokens: list[tuple[str, str]] = []  # [(clean_word, terminator), ...]
+        for line in script.lines:
+            for raw in line.text.split():
+                clean, term = _clean_word(raw)
+                if clean:
+                    script_tokens.append((clean, term))
+
+        if not script_tokens:
+            return words
+
+        # 2. Versões normalizadas pra matching
+        script_norm = [_normalize(t[0]) for t in script_tokens]
+        audio_norm = [_normalize(w.word) for w in words]
+
+        matcher = difflib.SequenceMatcher(a=audio_norm, b=script_norm, autojunk=False)
+        ratio = matcher.ratio()
+        if ratio < 0.4:
+            logger.warning(
+                f"[Realign] ratio={ratio:.2f} muito baixo — mantendo texto transcrito. "
+                f"(audio={len(words)} palavras, roteiro={len(script_tokens)} palavras)"
+            )
+            return words
+
+        new_words: list[WordTimestamp] = []
+        last_end = words[0].start if words else 0.0
+
+        for op, i1, i2, j1, j2 in matcher.get_opcodes():
+            if op == "equal":
+                # Match perfeito: timestamp do áudio + texto do roteiro
+                for audio_i, script_j in zip(range(i1, i2), range(j1, j2)):
+                    clean, term = script_tokens[script_j]
+                    new_words.append(WordTimestamp(
+                        word=clean,
+                        start=words[audio_i].start,
+                        end=words[audio_i].end,
+                        terminator=term,
+                    ))
+                    last_end = words[audio_i].end
+            elif op == "replace":
+                # Divergiu: usa intervalo do áudio, distribui as palavras do roteiro
+                audio_span = words[i1:i2]
+                script_span = script_tokens[j1:j2]
+                if audio_span and script_span:
+                    start = audio_span[0].start
+                    end = audio_span[-1].end
+                    step = (end - start) / max(1, len(script_span))
+                    for k, (clean, term) in enumerate(script_span):
+                        new_words.append(WordTimestamp(
+                            word=clean,
+                            start=start + k * step,
+                            end=start + (k + 1) * step,
+                            terminator=term,
+                        ))
+                    last_end = end
+                elif script_span and not audio_span:
+                    # Só roteiro: interpola perto do last_end
+                    for clean, term in script_span:
+                        new_words.append(WordTimestamp(
+                            word=clean,
+                            start=last_end,
+                            end=last_end + 0.15,
+                            terminator=term,
+                        ))
+                        last_end += 0.15
+            elif op == "insert":
+                # Roteiro tem palavras que o áudio não tem (TTS "comeu" palavra)
+                script_span = script_tokens[j1:j2]
+                for clean, term in script_span:
+                    new_words.append(WordTimestamp(
+                        word=clean,
+                        start=last_end,
+                        end=last_end + 0.15,
+                        terminator=term,
+                    ))
+                    last_end += 0.15
+            # op == "delete": palavras do áudio fora do roteiro → descarta
+
+        if not new_words:
+            return words
+
+        # Sort defensivo (inserts com last_end podem empurrar timestamps
+        # ligeiramente fora de ordem em casos patológicos). A lista final
+        # precisa ser estritamente crescente em .start pra _align_words_to_scenes
+        # funcionar corretamente.
+        new_words.sort(key=lambda w: w.start)
+
+        logger.info(
+            f"[Realign] ratio={ratio:.2f} | "
+            f"audio={len(words)} → saída={len(new_words)} palavras (texto do roteiro)"
+        )
+        return new_words
 
     # ============================================
     # Alinhamento FUZZY: cada ScriptLine → janela de palavras reais
@@ -318,24 +576,43 @@ class PipelineOrchestrator:
         if not queries:
             queries = ["cinematic"]
 
+        # Quando é sub-clip (clip_index > 0), rotaciona a ordem das queries
+        # pra buscar mídia DIFERENTE. Ex: se queries=["motivação", "superação",
+        # "vitória"] e clip_index=1, começa em "superação".
+        if scene.clip_index > 0 and len(queries) > 1:
+            rot = scene.clip_index % len(queries)
+            queries = queries[rot:] + queries[:rot]
+
+        # Variation index só pra sub-clips — garante resultado determinístico
+        # diferente da principal (clip 0 = random, clips 1+ = índices fixos).
+        var_idx = scene.clip_index if scene.clip_index > 0 else None
+
         if st == SceneType.VIDEO_BROLL:
-            path = self.media.fetch_video(queries)
+            path = self.media.fetch_video(queries, variation_index=var_idx)
             if not path:
                 # Fallback: imagem
-                path = self.media.fetch_image(queries)
+                path = self.media.fetch_image(queries, variation_index=var_idx)
                 if path:
                     line.scene_type = SceneType.IMAGE_KENBURNS
             scene.media_path = path
 
         elif st == SceneType.IMAGE_KENBURNS:
-            scene.media_path = self.media.fetch_image(queries)
+            scene.media_path = self.media.fetch_image(queries, variation_index=var_idx)
 
         elif st == SceneType.PERSON_PHOTO:
-            if line.person_name:
+            # Para sub-clips de pessoa, alterna: clip 0 usa foto, clips
+            # seguintes buscam b-roll contextual (ex: estádio, medalha)
+            # pra quebrar monotonia visual.
+            if scene.clip_index == 0 and line.person_name:
                 scene.media_path = self.media.fetch_person(line.person_name)
             if not scene.media_path:
-                scene.media_path = self.media.fetch_image(queries)
-                line.scene_type = SceneType.IMAGE_KENBURNS
+                # Busca vídeo contextual usando queries do roteiro
+                scene.media_path = self.media.fetch_video(queries, variation_index=var_idx)
+                if scene.media_path:
+                    line.scene_type = SceneType.VIDEO_BROLL
+                else:
+                    scene.media_path = self.media.fetch_image(queries, variation_index=var_idx)
+                    line.scene_type = SceneType.IMAGE_KENBURNS
 
         elif st == SceneType.COLOR_BACKGROUND:
             scene.media_path = None  # gerado via lavfi

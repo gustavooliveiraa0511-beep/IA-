@@ -63,19 +63,46 @@ class ClipPreparer:
     def prepare(self, scene: Scene, output_path: Path) -> Path:
         duration = scene.duration
         if scene.script_line.scene_type == SceneType.VIDEO_BROLL:
-            return self._prep_video(scene.media_path, duration, output_path)
+            path = self._prep_video(scene.media_path, duration, output_path)
         elif scene.script_line.scene_type == SceneType.IMAGE_KENBURNS:
-            return self._prep_image_kenburns(scene.media_path, duration, output_path)
+            path = self._prep_image_kenburns(scene.media_path, duration, output_path)
         elif scene.script_line.scene_type == SceneType.PERSON_PHOTO:
-            return self._prep_person_photo(scene.media_path, duration, output_path)
+            path = self._prep_person_photo(scene.media_path, duration, output_path)
         elif scene.script_line.scene_type == SceneType.COLOR_BACKGROUND:
-            return self._prep_color_bg(
+            path = self._prep_color_bg(
                 scene.script_line.bg_color or "#000000",
                 duration,
                 output_path,
             )
         else:
             raise ValueError(f"Scene type desconhecido: {scene.script_line.scene_type}")
+
+        # Pattern interrupt: flash branco 100ms no início do clipe.
+        # Usa fade "in" na cor branca — os primeiros 100ms da imagem/vídeo
+        # emergem de um overlay branco. Efeito sutil mas perceptível.
+        if scene.flash_intro:
+            path = self._apply_flash_intro(path)
+        return path
+
+    @staticmethod
+    def _apply_flash_intro(clip_path: Path) -> Path:
+        """
+        Aplica um flash branco de 100ms no início do clipe.
+        Usa fade=in:color=white — o vídeo emerge de branco em 0.1s.
+        """
+        tmp = clip_path.with_suffix(".flash.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-i", str(clip_path),
+            "-vf", "fade=t=in:st=0:d=0.10:color=white",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(tmp),
+        ]
+        _run(cmd, f"flash intro on {clip_path.name}")
+        # Substitui o arquivo original
+        tmp.replace(clip_path)
+        return clip_path
 
     def _prep_video(self, media_path: Optional[Path], duration: float, out: Path) -> Path:
         """
@@ -121,6 +148,11 @@ class ClipPreparer:
         Imagem com Ken Burns effect: zoom/pan ao longo da cena.
         Nunca fica estática.
 
+        Com sub-clips de 2s, o zoom precisa ser PROPORCIONAL à duração pra
+        que o movimento seja perceptível (uma cena curta com zoom lento
+        parece parada). Ken Burns adaptativo: clipes curtos têm zoom mais
+        agressivo, clipes longos têm movimento suave.
+
         Usa scale 2x (não 4x — consome muita memória no GitHub Actions)
         e zoompan com expressões testadas.
         """
@@ -133,7 +165,7 @@ class ClipPreparer:
         scale_h = self.h * 2
 
         movement = random.choice(["zoom_in", "zoom_out", "pan_right", "pan_left"])
-        z_expr, x_expr, y_expr = self._kenburns_expressions(movement, frames)
+        z_expr, x_expr, y_expr = self._kenburns_expressions(movement, frames, duration)
 
         vf = (
             f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase:flags=lanczos,"
@@ -171,8 +203,13 @@ class ClipPreparer:
         scale_w = self.w * 2
         scale_h = self.h * 2
 
-        # Zoom-in leve e centralizado (sem pan lateral, fica mais elegante em rosto)
-        z_expr = "min(zoom+0.0008,1.08)"
+        # Zoom-in leve e centralizado (sem pan lateral, fica mais elegante em rosto).
+        # Adaptativo à duração: em clipes curtos o zoom precisa ser maior pra dar
+        # sensação de movimento (antes era fixo 1.08x que sumia em 2s).
+        duration_safe = max(1.0, duration)
+        zoom_max = max(1.06, min(1.14, 1.06 + 0.14 / duration_safe))
+        zoom_step = (zoom_max - 1.0) / max(1, frames)
+        z_expr = f"min(zoom+{zoom_step:.5f},{zoom_max:.3f})"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
 
@@ -221,26 +258,45 @@ class ClipPreparer:
         return out
 
     @staticmethod
-    def _kenburns_expressions(movement: str, frames: int) -> tuple[str, str, str]:
-        """Retorna (zoom, x, y) expressions pro zoompan filter."""
+    def _kenburns_expressions(
+        movement: str, frames: int, duration: float = 3.0
+    ) -> tuple[str, str, str]:
+        """
+        Retorna (zoom, x, y) expressions pro zoompan filter.
+
+        Ken Burns adaptativo à duração: cenas curtas (~2s) recebem zoom mais
+        agressivo (até 1.18x) pra que o movimento seja visível; cenas longas
+        (>4s) ficam mais suaves (até 1.08x). Os "steps" (0.0015 etc) são
+        recalibrados pra que o movimento cubra 100% do clipe sem parar antes.
+        """
+        # Cena curta → zoom mais intenso; longa → suave
+        # 2s → ~1.18x, 3s → ~1.13x, 4s → ~1.10x, 6s+ → ~1.08x
+        duration = max(1.0, duration)
+        zoom_max = max(1.08, min(1.18, 1.08 + 0.20 / duration))
+        # Step calibrado pra atingir zoom_max exatamente no último frame
+        zoom_step = (zoom_max - 1.0) / max(1, frames)
+
         if movement == "zoom_in":
-            z = f"min(zoom+0.0015,1.15)"
+            z = f"min(zoom+{zoom_step:.5f},{zoom_max:.3f})"
             x = "iw/2-(iw/zoom/2)"
             y = "ih/2-(ih/zoom/2)"
         elif movement == "zoom_out":
-            z = f"if(lte(zoom,1.0),1.15,max(1.001,zoom-0.0015))"
+            z = f"if(lte(zoom,1.0),{zoom_max:.3f},max(1.001,zoom-{zoom_step:.5f}))"
             x = "iw/2-(iw/zoom/2)"
             y = "ih/2-(ih/zoom/2)"
         elif movement == "pan_right":
-            z = "1.1"
+            # Pan usa zoom fixo levemente menor pra dar espaço pro movimento
+            z_fixed = f"{min(1.12, zoom_max):.3f}"
+            z = z_fixed
             x = f"iw/zoom*(on/{frames})"
             y = "ih/2-(ih/zoom/2)"
         elif movement == "pan_left":
-            z = "1.1"
+            z_fixed = f"{min(1.12, zoom_max):.3f}"
+            z = z_fixed
             x = f"iw/zoom-(iw/zoom*(on/{frames}))"
             y = "ih/2-(ih/zoom/2)"
-        else:  # zoom_pan
-            z = f"min(zoom+0.001,1.12)"
+        else:  # zoom_pan combinado
+            z = f"min(zoom+{zoom_step * 0.7:.5f},{zoom_max:.3f})"
             x = f"iw/2-(iw/zoom/2)+(iw*0.05*(on/{frames}))"
             y = f"ih/2-(ih/zoom/2)"
         return z, x, y
@@ -465,10 +521,15 @@ class FinalAssembler:
         output_path: Path,
         music_path: Optional[Path] = None,
         sfx_events: Optional[list[tuple[float, Path]]] = None,
+        with_progress_bar: bool = True,
     ) -> Path:
         """
         sfx_events: lista de (timestamp_segundos, caminho_sfx)
         music_path: música de fundo (opcional, volume baixo)
+        with_progress_bar: desenha barra sutil de progresso no topo (4px, 55% opacidade).
+            Recurso comprovado de retenção: vídeos com barra de progresso
+            visível retêm mais porque o usuário vê "está acabando" e não
+            abandona antes do payoff.
         """
         inputs: list[str] = ["-i", str(video_path), "-i", str(narration_path)]
         input_idx = 2  # próximos índices pros inputs extras
@@ -552,7 +613,26 @@ class FinalAssembler:
             .replace("]", r"\]")
             .replace("'", r"\\\'")
         )
-        video_filter = f"[0:v]ass={subtitle_escaped}[vsubs]"
+
+        # Cadeia de filtros no vídeo: [progress bar] → [ass subtitles]
+        # Progress bar 4px no topo com opacidade 55%, cor branca.
+        # Largura cresce com t (tempo atual do frame) relativa à duração total.
+        # Sem aspas ao redor da expressão pra não conflitar com parser do
+        # filter_complex (; separa filter chains, , separa filtros).
+        video_filter_chain: list[str] = []
+        if with_progress_bar:
+            total_dur = _probe_duration(video_path)
+            if total_dur > 0.5:
+                # `w=iw*t/TOTAL` onde t = PTS do frame em segundos.
+                # Barra vai crescendo do 0 até iw (largura do vídeo) ao longo
+                # da duração total. Vírgulas internas do drawbox usam `:` como
+                # separador de key-value, então não há conflito com filter_complex.
+                video_filter_chain.append(
+                    f"drawbox=x=0:y=0:w=iw*t/{total_dur:.3f}:h=4:"
+                    f"color=white@0.55:t=fill"
+                )
+        video_filter_chain.append(f"ass={subtitle_escaped}")
+        video_filter = f"[0:v]{','.join(video_filter_chain)}[vsubs]"
 
         filter_complex = ";".join([video_filter] + audio_filters)
 
