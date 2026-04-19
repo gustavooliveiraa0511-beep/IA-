@@ -25,7 +25,7 @@ logger = get_logger(__name__)
 
 
 def _run(cmd: list[str], description: str = "") -> None:
-    """Roda comando FFmpeg com log bonito e captura erro."""
+    """Roda comando FFmpeg com log bonito e captura erro completo."""
     if description:
         logger.info(f"FFmpeg: {description}")
     result = subprocess.run(
@@ -34,9 +34,19 @@ def _run(cmd: list[str], description: str = "") -> None:
         text=True,
     )
     if result.returncode != 0:
-        logger.error(f"FFmpeg falhou: {' '.join(cmd[:5])} ...")
-        logger.error(result.stderr[-2000:])
-        raise RuntimeError(f"FFmpeg falhou em: {description}")
+        # Log completo pra debug
+        logger.error("=" * 60)
+        logger.error(f"FFmpeg FALHOU em: {description}")
+        logger.error(f"Comando: {' '.join(cmd)}")
+        logger.error("--- stderr (últimas 3000 chars) ---")
+        logger.error(result.stderr[-3000:] if result.stderr else "(vazio)")
+        logger.error("=" * 60)
+        # Mensagem de erro mais informativa
+        err_preview = (result.stderr or "").strip().split("\n")[-3:]
+        raise RuntimeError(
+            f"FFmpeg falhou em: {description}\n"
+            f"Últimas linhas: {' | '.join(err_preview)}"
+        )
 
 
 # ============================================
@@ -69,42 +79,36 @@ class ClipPreparer:
 
     def _prep_video(self, media_path: Optional[Path], duration: float, out: Path) -> Path:
         """
-        Vídeo b-roll: corta na duração da cena, escala pra 9:16 preenchendo
-        com crop. Aplica zoom progressivo via crop com expressão temporal
-        (zoompan NÃO funciona em vídeo — ele congelaria no frame 0).
+        Vídeo b-roll: encaixa em 9:16 (1080x1920) com crop central.
+        Vídeos b-roll já têm movimento natural (cena gravada), então
+        não precisa adicionar zoom sintético que complica o filtro.
+
+        Estratégia simples e robusta:
+        - scale pra preencher 1080x1920 mantendo proporção (sobra é cortada)
+        - crop central nas dimensões exatas
+        - força sar=1 pra evitar distorção
         """
         if not media_path or not media_path.exists():
-            # Fallback: fundo preto
             return self._prep_color_bg("#000000", duration, out)
 
-        # Escolhe um ponto de início aleatório se o vídeo for mais longo
         start_offset = self._pick_random_start(media_path, duration)
 
-        # Estratégia: scale grande + crop dinâmico pra simular zoom lento
-        # z = 1.0 + 0.05 * (t/duration) → zoom de 100% a 105% ao longo da cena
-        # crop usa iw/z x ih/z centralizado → sempre dimensões pares via round-to-even
-        z_factor = 1.05
-        # Escala inicial pra 1080x1920 (com crop de excesso)
+        # Filtro mínimo e confiável:
+        # 1. Scale mantendo aspect, usando par (-2) pra libx264
+        # 2. Crop central nas dimensões exatas
         vf = (
-            f"scale=-2:{self.h * 2}:force_original_aspect_ratio=increase,"
-            f"crop={self.w * 2}:{self.h * 2},"
-            # Zoom progressivo via crop com expressão temporal
-            # zoom factor varia de 1.0 a z_factor durante a cena
-            f"crop="
-            f"w='iw/(1+{z_factor-1}*t/{duration})':"
-            f"h='ih/(1+{z_factor-1}*t/{duration})':"
-            f"x='(iw-ow)/2':y='(ih-oh)/2',"
-            # Scale final pra resolução alvo (força dimensões pares)
-            f"scale={self.w}:{self.h}:flags=bicubic,"
+            f"scale=w={self.w}:h={self.h}:force_original_aspect_ratio=increase,"
+            f"crop={self.w}:{self.h},"
             f"setsar=1"
         )
 
         cmd = [
-            "ffmpeg", "-y", "-ss", str(start_offset), "-i", str(media_path),
-            "-t", str(duration),
+            "ffmpeg", "-y",
+            "-ss", str(start_offset), "-i", str(media_path),
+            "-t", f"{duration:.3f}",
             "-vf", vf,
             "-r", str(self.fps),
-            "-an",  # remove áudio original
+            "-an",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
             "-pix_fmt", "yuv420p",
             str(out),
@@ -114,30 +118,34 @@ class ClipPreparer:
 
     def _prep_image_kenburns(self, media_path: Optional[Path], duration: float, out: Path) -> Path:
         """
-        Imagem com Ken Burns: zoom in + pan lento. NUNCA fica estática.
-        Escolhe aleatoriamente entre zoom-in, zoom-out, pan-left, pan-right.
+        Imagem com Ken Burns effect: zoom/pan ao longo da cena.
+        Nunca fica estática.
+
+        Usa scale 2x (não 4x — consome muita memória no GitHub Actions)
+        e zoompan com expressões testadas.
         """
         if not media_path or not media_path.exists():
             return self._prep_color_bg("#000000", duration, out)
 
-        frames = int(duration * self.fps)
-        # Renderiza em resolução alta pra zoompan não ficar pixelado
-        scale_w = self.w * 4
-        scale_h = self.h * 4
+        frames = max(1, int(duration * self.fps))
+        # 2x é suficiente pra zoom até 1.15x sem pixelizar
+        scale_w = self.w * 2
+        scale_h = self.h * 2
 
-        movement = random.choice(["zoom_in", "zoom_out", "pan_right", "pan_left", "zoom_pan"])
+        movement = random.choice(["zoom_in", "zoom_out", "pan_right", "pan_left"])
         z_expr, x_expr, y_expr = self._kenburns_expressions(movement, frames)
 
         vf = (
             f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,"
             f"crop={scale_w}:{scale_h},"
             f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
-            f"d={frames}:s={self.w}x{self.h}:fps={self.fps}"
+            f"d={frames}:s={self.w}x{self.h}:fps={self.fps},"
+            f"setsar=1"
         )
 
         cmd = [
             "ffmpeg", "-y", "-loop", "1", "-i", str(media_path),
-            "-t", str(duration),
+            "-t", f"{duration:.3f}",
             "-vf", vf,
             "-r", str(self.fps),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
@@ -149,32 +157,36 @@ class ClipPreparer:
 
     def _prep_person_photo(self, media_path: Optional[Path], duration: float, out: Path) -> Path:
         """
-        Foto de pessoa: zoom suave no rosto + fundo desfocado preenchendo
-        o 9:16 (melhor que barras pretas).
+        Foto de pessoa: usa o mesmo Ken Burns das imagens normais,
+        mas com movimento mais sutil (zoom in lento, sem pan).
 
-        IMPORTANTE: usa -2 em scale (não -1) pra forçar dimensão PAR, senão
-        libx264 quebra com "height not divisible by 2".
+        Simplifiquei pra usar só o zoompan (mesma pipeline da imagem)
+        porque o filter_complex com split+blur+overlay é MUITO mais
+        frágil e quebra por pequenas diferenças de dimensões.
         """
         if not media_path or not media_path.exists():
             return self._prep_color_bg("#000000", duration, out)
 
-        frames = int(duration * self.fps)
-        # Altura do foreground (80% do vídeo, arredondada pra par)
-        fg_h = (int(self.h * 0.8) // 2) * 2
+        frames = max(1, int(duration * self.fps))
+        scale_w = self.w * 2
+        scale_h = self.h * 2
 
-        # Fundo blur da própria imagem, foto com zoom leve por cima
+        # Zoom-in leve e centralizado (sem pan lateral, fica mais elegante em rosto)
+        z_expr = "min(zoom+0.0008,1.08)"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+
         vf = (
-            f"[0:v]split=2[bg][fg];"
-            f"[bg]scale={self.w}:{self.h}:force_original_aspect_ratio=increase,"
-            f"crop={self.w}:{self.h},boxblur=40:5[bgb];"
-            f"[fg]scale={self.w}:-2:force_original_aspect_ratio=decrease,"
-            f"zoompan=z='min(zoom+0.0008,1.08)':d={frames}:s={self.w}x{fg_h}:fps={self.fps}[fgz];"
-            f"[bgb][fgz]overlay=(W-w)/2:(H-h)/2"
+            f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,"
+            f"crop={scale_w}:{scale_h},"
+            f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
+            f"d={frames}:s={self.w}x{self.h}:fps={self.fps},"
+            f"setsar=1"
         )
         cmd = [
             "ffmpeg", "-y", "-loop", "1", "-i", str(media_path),
-            "-t", str(duration),
-            "-filter_complex", vf,
+            "-t", f"{duration:.3f}",
+            "-vf", vf,
             "-r", str(self.fps),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
             "-pix_fmt", "yuv420p",
