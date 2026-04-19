@@ -102,9 +102,12 @@ class PipelineOrchestrator:
             # ==========================================
             if not words:
                 logger.info(
-                    f"[{job.job_id}] WordBoundary indisponível — chamando Whisper"
+                    f"[{job.job_id}] WordBoundary indisponível — chamando Whisper (medium)"
                 )
-                transcriber = Transcriber(model_size="small")
+                # Whisper medium (~770 MB) só é usado no caso raro de Piper/gTTS.
+                # Qualidade de transcrição notavelmente melhor que "small";
+                # modelo é cacheado no Actions via actions/cache.
+                transcriber = Transcriber(model_size="medium")
                 words = transcriber.transcribe(narration_path)
 
             if not words:

@@ -97,7 +97,7 @@ class ClipPreparer:
         # 1. Scale mantendo aspect, usando par (-2) pra libx264
         # 2. Crop central nas dimensões exatas
         vf = (
-            f"scale=w={self.w}:h={self.h}:force_original_aspect_ratio=increase,"
+            f"scale=w={self.w}:h={self.h}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={self.w}:{self.h},"
             f"setsar=1"
         )
@@ -109,7 +109,7 @@ class ClipPreparer:
             "-vf", vf,
             "-r", str(self.fps),
             "-an",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
             "-pix_fmt", "yuv420p",
             str(out),
         ]
@@ -136,7 +136,7 @@ class ClipPreparer:
         z_expr, x_expr, y_expr = self._kenburns_expressions(movement, frames)
 
         vf = (
-            f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,"
+            f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={scale_w}:{scale_h},"
             f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
             f"d={frames}:s={self.w}x{self.h}:fps={self.fps},"
@@ -148,7 +148,7 @@ class ClipPreparer:
             "-t", f"{duration:.3f}",
             "-vf", vf,
             "-r", str(self.fps),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
             "-pix_fmt", "yuv420p",
             str(out),
         ]
@@ -177,7 +177,7 @@ class ClipPreparer:
         y_expr = "ih/2-(ih/zoom/2)"
 
         vf = (
-            f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,"
+            f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={scale_w}:{scale_h},"
             f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
             f"d={frames}:s={self.w}x{self.h}:fps={self.fps},"
@@ -188,7 +188,7 @@ class ClipPreparer:
             "-t", f"{duration:.3f}",
             "-vf", vf,
             "-r", str(self.fps),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
             "-pix_fmt", "yuv420p",
             str(out),
         ]
@@ -213,7 +213,7 @@ class ClipPreparer:
                 # Pulsação de brilho muito leve
                 "eq=brightness='0.02*sin(2*PI*t/2)'"
             ),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
             "-pix_fmt", "yuv420p",
             str(out),
         ]
@@ -311,7 +311,7 @@ class SceneConcatenator:
         cmd = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(list_file),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
             "-pix_fmt", "yuv420p",
             "-r", str(self.fps),
             str(output),
@@ -377,6 +377,16 @@ class FinalAssembler:
             )
             last_audio_label = "finalaudio"
 
+        # Pós-processamento de áudio (mix final):
+        # - highpass 80Hz: remove rumble/low-end vazio que muitos celulares reproduzem mal.
+        # - loudnorm EBU R128 (I=-14, TP=-1.5, LRA=11): padrão de streaming (TikTok/YouTube).
+        #   Single-pass é "bom o suficiente" e não custa tempo extra (two-pass analisa primeiro).
+        audio_filters.append(
+            f"[{last_audio_label}]highpass=f=80,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
+        )
+        final_audio_label = "aout"
+
         # Legenda ASS queimada no vídeo
         # Pro filtro ass=, o truque mais confiável no Linux é usar o path
         # ABSOLUTO do arquivo copiado pra CWD (sem espaços/caracteres especiais).
@@ -395,14 +405,18 @@ class FinalAssembler:
 
         filter_complex = ";".join([video_filter] + audio_filters)
 
+        # Encoding final com mais qualidade:
+        # - preset "slow" + crf 18: qualidade visual notavelmente melhor que "medium"/crf 20.
+        # - AAC 256k: headroom maior pra mix com música (PR 3).
+        # Custa ~1 min a mais por vídeo, mas cabe nos 25min do Actions.
         cmd = [
             "ffmpeg", "-y",
             *inputs,
             "-filter_complex", filter_complex,
             "-map", "[vsubs]",
-            "-map", f"[{last_audio_label}]",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-c:a", "aac", "-b:a", "192k",
+            "-map", f"[{final_audio_label}]",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            "-c:a", "aac", "-b:a", "256k",
             "-pix_fmt", "yuv420p",
             "-r", str(self.fps),
             "-movflags", "+faststart",
