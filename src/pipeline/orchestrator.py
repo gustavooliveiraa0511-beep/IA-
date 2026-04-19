@@ -106,7 +106,14 @@ class PipelineOrchestrator:
             # 4. Divide palavras em cenas (alinhamento
             #    por texto das frases do roteiro)
             # ==========================================
+            if not words:
+                raise RuntimeError(
+                    "Whisper não detectou fala na narração. "
+                    "Tente outro tema ou verifique se o Edge TTS funcionou."
+                )
             job.scenes = self._align_words_to_scenes(job.script, words)
+            if not job.scenes:
+                raise RuntimeError("Nenhuma cena gerada após alinhamento de palavras.")
 
             # ==========================================
             # 5+6. Busca mídia e prepara clipes 9:16
@@ -210,11 +217,22 @@ class PipelineOrchestrator:
             scenes[-1].words.extend(tail)
             scenes[-1].end_time = tail[-1].end
 
-        # Corrige sobreposições e mantém min duration
-        MIN_DURATION = 1.2
+        # Garante duração mínima SEM:
+        # - expandir além do total da narração (-shortest cortaria narração)
+        # - sobrepor com a cena seguinte (causa desalinhamento de legendas)
+        MIN_DURATION = 1.0
+        total_end = scenes[-1].end_time if scenes else 0
         for i, sc in enumerate(scenes):
             if sc.duration < MIN_DURATION:
-                sc.end_time = sc.start_time + MIN_DURATION
+                # Limite superior: início da próxima cena (ou fim do áudio)
+                upper_limit = (
+                    scenes[i + 1].start_time
+                    if i + 1 < len(scenes)
+                    else total_end
+                )
+                new_end = min(sc.start_time + MIN_DURATION, upper_limit)
+                if new_end > sc.end_time:
+                    sc.end_time = new_end
 
         return scenes
 

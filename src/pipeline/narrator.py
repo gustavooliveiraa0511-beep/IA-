@@ -41,7 +41,7 @@ class Narrator:
     def __init__(self, voice: str = "pt-BR-AntonioNeural") -> None:
         self.voice = voice
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10), reraise=True)
     def narrate(self, text: str, output_path: Path, rate: str = "+0%", pitch: str = "+0Hz") -> Path:
         """
         Gera narração MP3 do texto.

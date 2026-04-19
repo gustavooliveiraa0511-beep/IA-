@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 @dataclass
 class CaptionStyle:
     """Define a aparência da legenda. Cada template tem o seu."""
-    font_name: str = "Impact"
+    font_name: str = "Anton"
     font_size: int = 92
     primary_color: str = "&H00FFFFFF"      # branco (BGR + alpha invertido)
     emphasis_color: str = "&H0000D7FF"     # laranja/dourado (destaque)
@@ -44,7 +44,7 @@ class CaptionStyle:
 
 # Estilos pré-definidos por template
 STYLE_MOTIVACIONAL = CaptionStyle(
-    font_name="Impact",
+    font_name="Anton",
     font_size=96,
     primary_color="&H00FFFFFF",       # branco
     emphasis_color="&H0000D7FF",      # dourado (#FFD700 em BGR)
@@ -57,7 +57,7 @@ STYLE_MOTIVACIONAL = CaptionStyle(
 )
 
 STYLE_VIRAL = CaptionStyle(
-    font_name="Impact",
+    font_name="Anton",
     font_size=100,
     primary_color="&H0000FFFF",       # amarelo
     emphasis_color="&H000000FF",      # vermelho vibrante
@@ -84,7 +84,7 @@ STYLE_NOTICIAS = CaptionStyle(
 )
 
 STYLE_GAMING = CaptionStyle(
-    font_name="Impact",
+    font_name="Anton",
     font_size=98,
     primary_color="&H0000FFFF",       # amarelo
     emphasis_color="&H00FF00FF",      # magenta
@@ -183,11 +183,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
             # Palavra "ativa" (sendo falada) dentro da janela
             active_index_in_window = i - window_start
 
-            # Timing: esta linha aparece enquanto a palavra ativa é falada
+            # Timing: esta linha aparece enquanto a palavra ativa é falada.
+            # Fecha exatamente no start da próxima palavra pra evitar overlap
+            # e flicker de 2 eventos ASS renderizados ao mesmo tempo.
             start_t = words[i].start
-            # Termina na próxima palavra ou no fim da janela
             if i + 1 < n:
-                end_t = max(words[i + 1].start, start_t + 0.15)
+                end_t = max(words[i + 1].start, start_t + 0.05)
             else:
                 end_t = words[i].end + 0.3
 

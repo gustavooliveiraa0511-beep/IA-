@@ -9,6 +9,7 @@ import hashlib
 import random
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 import wikipediaapi
@@ -48,7 +49,6 @@ class PexelsFetcher:
         if not self.api_key:
             raise ValueError("PEXELS_API_KEY não configurado")
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8))
     def search_video(
         self,
         query: str,
@@ -58,8 +58,24 @@ class PexelsFetcher:
     ) -> Optional[Path]:
         """
         Busca vídeo curto no Pexels e baixa.
-        Retorna Path local ou None se não encontrar.
+        Retorna Path local ou None se não encontrar/falhar.
         """
+        try:
+            return self._search_video_with_retry(
+                query, orientation, min_duration, max_duration
+            )
+        except Exception as e:
+            logger.warning(f"Pexels search falhou pra {query!r}: {e}")
+            return None
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8), reraise=True)
+    def _search_video_with_retry(
+        self,
+        query: str,
+        orientation: str,
+        min_duration: int,
+        max_duration: int,
+    ) -> Optional[Path]:
         logger.info(f"Pexels: buscando {query!r}")
         headers = {"Authorization": self.api_key}
         params = {
@@ -73,34 +89,37 @@ class PexelsFetcher:
         r.raise_for_status()
         data = r.json()
 
-        videos = data.get("videos", [])
+        videos = data.get("videos") or []
         candidates = [
             v for v in videos
-            if min_duration <= v.get("duration", 0) <= max_duration
+            if min_duration <= (v.get("duration") or 0) <= max_duration
         ]
         if not candidates:
-            candidates = videos  # pega qualquer coisa se filtro for muito estrito
+            candidates = videos
         if not candidates:
             logger.warning(f"Pexels: nada encontrado para {query!r}")
             return None
 
-        # Pega um aleatório dentro dos primeiros 5 resultados (diversidade)
         chosen = random.choice(candidates[:5])
-
-        # Escolhe o arquivo de melhor qualidade que seja vertical/quadrado
-        files = chosen.get("video_files", [])
-        # Ordena por altura (prioriza HD vertical)
-        files.sort(key=lambda f: (f.get("height", 0), f.get("width", 0)), reverse=True)
-        # Prefere vertical
-        vertical = [f for f in files if f.get("height", 0) > f.get("width", 0)]
-        pool = vertical if vertical else files
-        if not pool:
+        chosen_id = chosen.get("id")
+        if not chosen_id:
             return None
 
-        video_file = pool[0]
-        url = video_file["link"]
+        files = chosen.get("video_files") or []
+        files = [f for f in files if f.get("link")]  # filtra só com link
+        if not files:
+            return None
 
-        cache = _cache_path(f"pexels:{chosen['id']}", "mp4")
+        files.sort(key=lambda f: (f.get("height", 0), f.get("width", 0)), reverse=True)
+        vertical = [f for f in files if f.get("height", 0) > f.get("width", 0)]
+        pool = vertical if vertical else files
+
+        video_file = pool[0]
+        url = video_file.get("link")
+        if not url:
+            return None
+
+        cache = _cache_path(f"pexels:{chosen_id}", "mp4")
         if cache.exists():
             logger.info(f"Pexels: cache hit {cache.name}")
             return cache
@@ -121,8 +140,15 @@ class PixabayFetcher:
         if not self.api_key:
             raise ValueError("PIXABAY_API_KEY não configurado")
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8))
     def search_image(self, query: str, orientation: str = "vertical") -> Optional[Path]:
+        try:
+            return self._search_image_retry(query, orientation)
+        except Exception as e:
+            logger.warning(f"Pixabay image falhou pra {query!r}: {e}")
+            return None
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8), reraise=True)
+    def _search_image_retry(self, query: str, orientation: str) -> Optional[Path]:
         logger.info(f"Pixabay: buscando imagem {query!r}")
         params = {
             "key": self.api_key,
@@ -135,20 +161,30 @@ class PixabayFetcher:
         r = httpx.get(self.IMAGE_URL, params=params, timeout=30.0)
         r.raise_for_status()
         data = r.json()
-        hits = data.get("hits", [])
+        hits = data.get("hits") or []
         if not hits:
             logger.warning(f"Pixabay: sem imagens pra {query!r}")
             return None
 
         chosen = random.choice(hits[:10])
+        chosen_id = chosen.get("id")
         url = chosen.get("largeImageURL") or chosen.get("webformatURL")
-        cache = _cache_path(f"pixabay_img:{chosen['id']}", "jpg")
+        if not url or not chosen_id:
+            return None
+        cache = _cache_path(f"pixabay_img:{chosen_id}", "jpg")
         if cache.exists():
             return cache
         return _download(url, cache)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8))
     def search_video(self, query: str) -> Optional[Path]:
+        try:
+            return self._search_video_retry(query)
+        except Exception as e:
+            logger.warning(f"Pixabay video falhou pra {query!r}: {e}")
+            return None
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8), reraise=True)
+    def _search_video_retry(self, query: str) -> Optional[Path]:
         logger.info(f"Pixabay: buscando vídeo {query!r}")
         params = {
             "key": self.api_key,
@@ -158,19 +194,25 @@ class PixabayFetcher:
         r = httpx.get(self.VIDEO_URL, params=params, timeout=30.0)
         r.raise_for_status()
         data = r.json()
-        hits = data.get("hits", [])
+        hits = data.get("hits") or []
         if not hits:
             return None
         chosen = random.choice(hits[:5])
-        videos = chosen.get("videos", {})
-        # Prefere qualidade média (arquivo menor, mais rápido)
-        for quality in ("medium", "small", "large"):
-            if quality in videos:
-                url = videos[quality]["url"]
-                cache = _cache_path(f"pixabay_vid:{chosen['id']}", "mp4")
-                if cache.exists():
-                    return cache
-                return _download(url, cache)
+        chosen_id = chosen.get("id")
+        videos = chosen.get("videos") or {}
+        if not chosen_id:
+            return None
+        for quality in ("medium", "small", "large", "tiny"):
+            v = videos.get(quality)
+            if not v:
+                continue
+            url = v.get("url") if isinstance(v, dict) else v
+            if not url:
+                continue
+            cache = _cache_path(f"pixabay_vid:{chosen_id}", "mp4")
+            if cache.exists():
+                return cache
+            return _download(url, cache)
         return None
 
 
@@ -203,14 +245,14 @@ class WikipediaPhotoFetcher:
         return None
 
     def _try_fetch(self, name: str, lang: str) -> Optional[Path]:
-        # Usa REST API do Wikipedia (summary) que retorna thumbnail/original
-        url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{name.replace(' ', '_')}"
+        # URL-encode pra suportar nomes com acento/caracteres especiais
+        encoded = quote(name.replace(" ", "_"), safe="_")
+        url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{encoded}"
         try:
             r = httpx.get(url, timeout=15.0, follow_redirects=True)
             if r.status_code != 200:
                 return None
             data = r.json()
-            # Prefere 'originalimage', cai pra 'thumbnail'
             img = data.get("originalimage") or data.get("thumbnail")
             if not img or not img.get("source"):
                 return None

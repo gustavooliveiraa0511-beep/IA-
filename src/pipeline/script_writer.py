@@ -106,7 +106,7 @@ class ScriptWriter:
             raise ValueError("GROQ_API_KEY não configurado")
         self.client = Groq(api_key=config.groq_api_key)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10), reraise=True)
     def generate(self, request: VideoRequest) -> Script:
         logger.info(f"Gerando roteiro: tema={request.theme!r} template={request.template}")
 
@@ -153,18 +153,46 @@ class ScriptWriter:
     def _to_script(data: dict[str, Any]) -> Script:
         lines = []
         for item in data.get("lines", []):
+            # Hardening: tolera respostas mal formadas da IA
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue  # pula linhas sem texto
+
+            # scene_type: se inválido/ausente, usa VIDEO_BROLL como fallback
+            raw_scene = (item.get("scene_type") or "video_broll").strip().lower()
+            try:
+                scene_type = SceneType(raw_scene)
+            except ValueError:
+                logger.warning(f"scene_type inválido {raw_scene!r} — usando video_broll")
+                scene_type = SceneType.VIDEO_BROLL
+
+            emphasis = item.get("emphasis_words") or []
+            if not isinstance(emphasis, list):
+                emphasis = []
+
             lines.append(
                 ScriptLine(
-                    text=item["text"],
-                    scene_type=SceneType(item["scene_type"]),
-                    visual_query=item.get("visual_query", ""),
+                    text=text,
+                    scene_type=scene_type,
+                    visual_query=(item.get("visual_query") or "").strip(),
                     person_name=item.get("person_name"),
                     bg_color=item.get("bg_color"),
-                    emphasis_words=item.get("emphasis_words", []),
+                    emphasis_words=[str(w) for w in emphasis if w],
                 )
             )
+
+        if not lines:
+            raise RuntimeError(
+                "Groq retornou roteiro vazio/inválido. "
+                "Tente outro tema ou roda de novo."
+            )
+
+        hashtags = data.get("hashtags") or []
+        if not isinstance(hashtags, list):
+            hashtags = []
+
         return Script(
-            title=data.get("title", ""),
-            hashtags=data.get("hashtags", []),
+            title=(data.get("title") or "").strip(),
+            hashtags=[str(h) for h in hashtags if h],
             lines=lines,
         )

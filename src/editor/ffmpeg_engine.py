@@ -70,8 +70,8 @@ class ClipPreparer:
     def _prep_video(self, media_path: Optional[Path], duration: float, out: Path) -> Path:
         """
         Vídeo b-roll: corta na duração da cena, escala pra 9:16 preenchendo
-        com crop (ou padding se necessário) pra não ficar barra preta.
-        Adiciona um leve zoom-in (1.0→1.03) pra sempre ter movimento.
+        com crop. Aplica zoom progressivo via crop com expressão temporal
+        (zoompan NÃO funciona em vídeo — ele congelaria no frame 0).
         """
         if not media_path or not media_path.exists():
             # Fallback: fundo preto
@@ -80,13 +80,22 @@ class ClipPreparer:
         # Escolhe um ponto de início aleatório se o vídeo for mais longo
         start_offset = self._pick_random_start(media_path, duration)
 
-        # Filtro: escala pra caber, crop pro 9:16, zoom lento pra movimento
+        # Estratégia: scale grande + crop dinâmico pra simular zoom lento
+        # z = 1.0 + 0.05 * (t/duration) → zoom de 100% a 105% ao longo da cena
+        # crop usa iw/z x ih/z centralizado → sempre dimensões pares via round-to-even
+        z_factor = 1.05
+        # Escala inicial pra 1080x1920 (com crop de excesso)
         vf = (
-            f"scale={self.w*2}:{self.h*2}:force_original_aspect_ratio=increase,"
-            f"crop={self.w}:{self.h},"
-            # Zoom lento (1.0 -> 1.05) ao longo da cena
-            f"zoompan=z='min(zoom+0.0005,1.05)':d={int(duration*self.fps)}:"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={self.w}x{self.h}:fps={self.fps},"
+            f"scale=-2:{self.h * 2}:force_original_aspect_ratio=increase,"
+            f"crop={self.w * 2}:{self.h * 2},"
+            # Zoom progressivo via crop com expressão temporal
+            # zoom factor varia de 1.0 a z_factor durante a cena
+            f"crop="
+            f"w='iw/(1+{z_factor-1}*t/{duration})':"
+            f"h='ih/(1+{z_factor-1}*t/{duration})':"
+            f"x='(iw-ow)/2':y='(ih-oh)/2',"
+            # Scale final pra resolução alvo (força dimensões pares)
+            f"scale={self.w}:{self.h}:flags=bicubic,"
             f"setsar=1"
         )
 
@@ -142,18 +151,24 @@ class ClipPreparer:
         """
         Foto de pessoa: zoom suave no rosto + fundo desfocado preenchendo
         o 9:16 (melhor que barras pretas).
+
+        IMPORTANTE: usa -2 em scale (não -1) pra forçar dimensão PAR, senão
+        libx264 quebra com "height not divisible by 2".
         """
         if not media_path or not media_path.exists():
             return self._prep_color_bg("#000000", duration, out)
 
         frames = int(duration * self.fps)
+        # Altura do foreground (80% do vídeo, arredondada pra par)
+        fg_h = (int(self.h * 0.8) // 2) * 2
+
         # Fundo blur da própria imagem, foto com zoom leve por cima
         vf = (
             f"[0:v]split=2[bg][fg];"
             f"[bg]scale={self.w}:{self.h}:force_original_aspect_ratio=increase,"
             f"crop={self.w}:{self.h},boxblur=40:5[bgb];"
-            f"[fg]scale={self.w}:-1:force_original_aspect_ratio=decrease,"
-            f"zoompan=z='min(zoom+0.0008,1.08)':d={frames}:s={self.w}x{int(self.h*0.8)}:fps={self.fps}[fgz];"
+            f"[fg]scale={self.w}:-2:force_original_aspect_ratio=decrease,"
+            f"zoompan=z='min(zoom+0.0008,1.08)':d={frames}:s={self.w}x{fg_h}:fps={self.fps}[fgz];"
             f"[bgb][fgz]overlay=(W-w)/2:(H-h)/2"
         )
         cmd = [
@@ -175,16 +190,15 @@ class ClipPreparer:
         o fundo colorido.
         """
         hex_color = hex_color.lstrip("#")
-        # Gradiente radial sutil pra ter profundidade
-        # Usando ffmpeg color source + efeito de vignette
         cmd = [
             "ffmpeg", "-y",
             "-f", "lavfi",
-            "-i", f"color=c=0x{hex_color}:size={self.w}x{self.h}:rate={self.fps}:duration={duration}",
+            "-i", f"color=c=0x{hex_color}:size={self.w}x{self.h}:rate={self.fps}",
+            "-t", str(duration),  # garante duração correta
             "-vf", (
                 # Vinheta sutil
                 "vignette=PI/5,"
-                # Pulsação de brilho muito leve (1.0 -> 1.03)
+                # Pulsação de brilho muito leve
                 "eq=brightness='0.02*sin(2*PI*t/2)'"
             ),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
@@ -352,9 +366,20 @@ class FinalAssembler:
             last_audio_label = "finalaudio"
 
         # Legenda ASS queimada no vídeo
-        # Escape do caminho pro filtro ass= aceitar
-        subtitle_escaped = str(subtitle_ass_path).replace(":", r"\:").replace("'", r"\'")
-        video_filter = f"[0:v]ass='{subtitle_escaped}'[vsubs]"
+        # Pro filtro ass=, o truque mais confiável no Linux é usar o path
+        # ABSOLUTO do arquivo copiado pra CWD (sem espaços/caracteres especiais).
+        # Escape necessário em filter_complex: \ → \\, : → \:, , → \,, [ → \[, ] → \]
+        abs_path = str(subtitle_ass_path.resolve())
+        subtitle_escaped = (
+            abs_path
+            .replace("\\", "\\\\")
+            .replace(":", r"\:")
+            .replace(",", r"\,")
+            .replace("[", r"\[")
+            .replace("]", r"\]")
+            .replace("'", r"\\\'")
+        )
+        video_filter = f"[0:v]ass={subtitle_escaped}[vsubs]"
 
         filter_complex = ";".join([video_filter] + audio_filters)
 
