@@ -1,9 +1,10 @@
 """
 Gera roteiro estruturado usando Groq (Llama 3.3 70B).
 
-O roteiro já vem com instruções de cena: qual imagem, quando
-usar fundo colorido, quando mostrar foto de pessoa, quais palavras
-destacar na legenda.
+Estratégia robusta em 3 camadas pra garantir roteiro com tamanho certo:
+1. Prompt super explícito com EXEMPLO concreto
+2. Se vier curto, faz 2ª chamada pra EXPANDIR
+3. Se mesmo assim tiver curto, usa o que tem (não trava o pipeline)
 """
 from __future__ import annotations
 
@@ -57,52 +58,91 @@ Estilo GAMING / ENTRETENIMENTO:
 }
 
 
-SYSTEM_PROMPT = """Você é um roteirista especialista em vídeos curtos verticais (TikTok/Reels/Shorts) com alta retenção.
+SYSTEM_PROMPT = """Você é um roteirista especialista em vídeos motivacionais virais de {duration} segundos para TikTok/Reels.
 
-⚠️ REGRAS OBRIGATÓRIAS DE TAMANHO ⚠️
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 META PRINCIPAL: O ROTEIRO DEVE TER {target_words} PALAVRAS.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. DURAÇÃO ALVO: {duration} segundos narrados (NÃO menos!)
-2. TAMANHO TOTAL: o roteiro COMPLETO (somando todas as cenas) deve ter entre {min_words} e {max_words} palavras em português. NUNCA menos que {min_words}.
-3. NÚMERO DE CENAS: pelo menos {min_scenes} cenas, ideal {ideal_scenes}.
-4. POR CENA: cada cena tem 1-2 frases com 8 a 18 palavras cada (NUNCA menos de 8 palavras por cena).
-5. HOOK: a primeira cena é impacto forte nos primeiros 3 segundos — pergunta, fato surpreendente, ou afirmação forte.
-6. Use português BRASILEIRO natural, direto, emocional.
-7. Termine com call-to-action curto ("siga pra mais", "salva esse vídeo", etc.)
+Essa é a regra MAIS IMPORTANTE. Conte as palavras. Menos de {min_words} é FALHA GRAVE.
 
-⛔ NÃO escreva roteiro curto. Se escrever menos de {min_words} palavras, está ERRADO.
-⛔ NÃO use frases soltas de 3-4 palavras. Cada cena precisa de substância.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 EXEMPLO DE ROTEIRO CORRETO (tema: "nunca desista"):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Cena 1 (10 palavras): "Você já pensou em desistir hoje? Respira fundo e escuta."
+Cena 2 (14 palavras): "Todo grande nome que você admira já esteve exatamente onde você está agora."
+Cena 3 (13 palavras): "A diferença não é talento, é a teimosia de continuar quando dói."
+Cena 4 (15 palavras): "Cada tentativa falhada é um tijolo da ponte que vai te levar lá."
+Cena 5 (12 palavras): "O universo testa quem realmente quer antes de entregar o prêmio."
+Cena 6 (16 palavras): "Então respira, enxuga o rosto e volta pro jogo. Você veio longe demais pra parar."
+Cena 7 (9 palavras): "Salva esse vídeo e manda pra quem precisa ouvir."
+
+TOTAL: 89 palavras → ~35 segundos narrado. IDEAL.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⛔ EXEMPLO DE ROTEIRO RUIM (NUNCA FAÇA):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Cena 1: "Acredite"
+Cena 2: "Você consegue"
+Cena 3: "Vai em frente"
+→ Isso tem 5 palavras. É INACEITÁVEL. Sempre escreva FRASES COMPLETAS.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📐 REGRAS DE TAMANHO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ TOTAL: {target_words} palavras (±15%)
+✅ CENAS: {min_scenes} a {max_scenes} cenas
+✅ POR CENA: 8 a 18 palavras (frases completas, não pedaços)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 {template_instructions}
 
-Para cada cena escolha UM scene_type:
-- "video_broll": Cenas de ação, movimento, pessoas fazendo coisas. Use quando falar de ações.
-- "image_kenburns": Imagens estáticas que ganham movimento por zoom/pan. Use pra conceitos.
-- "color_background": Fundo liso colorido com a frase CENTRAL (frase de impacto isolada). Máximo 2x no vídeo.
-- "person_photo": Quando citar pessoa específica famosa. Defina person_name com o nome exato.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎬 TIPOS DE CENA (escolha um por cena):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Pra cada cena defina:
-- text: a frase (em português)
-- scene_type: um dos 4 acima
-- visual_query: termos em INGLÊS pra buscar no banco de vídeos (ex: "person running sunrise", "businessman success")
-- person_name: só se scene_type=person_photo
-- bg_color: só se scene_type=color_background. Hex. (#000000, #ff4500, #daa520, #b22222)
-- emphasis_words: 1-3 palavras MAIS IMPORTANTES da frase pra destacar na legenda
+- "video_broll": Ações e movimento. Use quando descrever ações.
+- "image_kenburns": Imagens estáticas com zoom. Use pra conceitos abstratos.
+- "color_background": Fundo liso colorido com FRASE CENTRAL de impacto. Máx 2x.
+- "person_photo": Só se citar pessoa famosa específica.
 
-RESPONDA APENAS em JSON válido com este formato exato:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📦 FORMATO JSON DA RESPOSTA:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 {{
-  "title": "título curto",
-  "hashtags": ["#motivacao", "#mindset", "..."],
+  "title": "título curto do vídeo",
+  "hashtags": ["#motivacao", "#mindset", "#disciplina"],
   "lines": [
     {{
-      "text": "...",
+      "text": "frase COMPLETA de 8-18 palavras",
       "scene_type": "video_broll",
-      "visual_query": "...",
+      "visual_query": "termos EM INGLÊS pra busca de vídeo (ex: person running sunrise)",
       "person_name": null,
       "bg_color": null,
       "emphasis_words": ["palavra1", "palavra2"]
     }}
   ]
 }}
+
+⚠️ ANTES DE RESPONDER: conte o TOTAL de palavras somando todas as cenas.
+Se for menos de {min_words}, REESCREVA tudo mais longo. É OBRIGATÓRIO.
+"""
+
+
+EXPAND_PROMPT = """O roteiro abaixo tem APENAS {current_words} palavras, mas precisa ter {target_words}.
+
+ROTEIRO ATUAL:
+{current_script}
+
+⚠️ TAREFA: EXPANDA esse roteiro mantendo o mesmo tema e tom, mas adicionando MAIS CENAS e EXPANDINDO as existentes pra atingir {target_words} palavras no total.
+
+Retorne APENAS o JSON expandido no mesmo formato (title, hashtags, lines).
+Cada cena deve ter 8-18 palavras COMPLETAS. Não corte palavras, ESCREVA MAIS.
 """
 
 
@@ -112,37 +152,105 @@ class ScriptWriter:
             raise ValueError("GROQ_API_KEY não configurado")
         self.client = Groq(api_key=config.groq_api_key)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10), reraise=True)
     def generate(self, request: VideoRequest) -> Script:
+        """
+        Gera roteiro com expansão automática se vier curto.
+        Nunca falha o pipeline por causa de tamanho — apenas warn.
+        """
         logger.info(f"Gerando roteiro: tema={request.theme!r} template={request.template}")
 
-        # Calcula metas de tamanho baseadas na duração
-        # ~150 palavras por minuto em PT-BR narrado
         duration = request.duration_seconds
-        target_words = int(duration * 150 / 60)   # ex: 30s → 75 palavras
-        min_words = int(target_words * 0.85)       # -15% tolerância
-        max_words = int(target_words * 1.20)       # +20% tolerância
-        min_scenes = max(5, duration // 6)         # pelo menos 1 cena a cada 6s
-        ideal_scenes = max(6, duration // 4)       # ideal: 1 cena a cada 4s
+        target_words = int(duration * 150 / 60)
+        min_words = int(target_words * 0.80)
+        max_words = int(target_words * 1.30)
+        min_scenes = max(5, duration // 6)
+        max_scenes = max(8, duration // 3)
 
-        system = SYSTEM_PROMPT.format(
+        # === TENTATIVA 1: geração normal ===
+        script = self._call_groq(
+            request=request,
             duration=duration,
+            target_words=target_words,
             min_words=min_words,
             max_words=max_words,
             min_scenes=min_scenes,
-            ideal_scenes=ideal_scenes,
+            max_scenes=max_scenes,
+        )
+        word_count = len(script.full_text.split())
+        logger.info(f"Tentativa 1: {len(script.lines)} cenas, {word_count} palavras (meta {target_words})")
+
+        # === TENTATIVA 2: expansão se curto ===
+        if word_count < min_words:
+            logger.warning(
+                f"Roteiro curto ({word_count} < {min_words}). "
+                f"Pedindo pra IA EXPANDIR..."
+            )
+            try:
+                expanded = self._expand_script(script, target_words)
+                expanded_words = len(expanded.full_text.split())
+                logger.info(f"Após expansão: {expanded_words} palavras")
+                if expanded_words > word_count:
+                    script = expanded
+                    word_count = expanded_words
+            except Exception as e:
+                logger.warning(f"Expansão falhou: {e}. Usando o roteiro original.")
+
+        # === FALLBACK FINAL: se ainda curto, usa mesmo assim (não crasha) ===
+        if word_count < min_words * 0.5:  # só alerta se < 50% do mínimo
+            logger.warning(
+                f"⚠️ Roteiro final tem {word_count} palavras (alvo {target_words}). "
+                f"Vídeo vai ficar mais curto que o ideal mas será gerado."
+            )
+
+        return script
+
+    def _call_groq(
+        self,
+        request: VideoRequest,
+        duration: int,
+        target_words: int,
+        min_words: int,
+        max_words: int,
+        min_scenes: int,
+        max_scenes: int,
+    ) -> Script:
+        system = SYSTEM_PROMPT.format(
+            duration=duration,
+            target_words=target_words,
+            min_words=min_words,
+            max_words=max_words,
+            min_scenes=min_scenes,
+            max_scenes=max_scenes,
             template_instructions=TEMPLATE_INSTRUCTIONS[request.template],
         )
 
         user = (
-            f"Tema do vídeo: {request.theme}\n\n"
-            f"REGRA REFORÇADA: escreva entre {min_words} e {max_words} palavras "
-            f"no total do roteiro. Isso equivale a aproximadamente {duration} segundos "
-            f"quando narrado. Verifique o tamanho antes de responder."
+            f"TEMA: {request.theme}\n\n"
+            f"Escreva um roteiro motivacional com {target_words} palavras "
+            f"(distribuídas em {min_scenes}-{max_scenes} cenas de 8-18 palavras cada). "
+            f"Siga o exemplo do sistema.\n\n"
+            f"Conte as palavras antes de responder."
         )
         if request.custom_script:
             user += f"\n\nTexto base do usuário (adapte em cenas):\n{request.custom_script}"
 
+        return self._run_groq(system, user)
+
+    def _expand_script(self, script: Script, target_words: int) -> Script:
+        """Segunda chamada: expande um roteiro curto."""
+        current_script = "\n".join(f"- {line.text}" for line in script.lines)
+        current_words = len(script.full_text.split())
+
+        user = EXPAND_PROMPT.format(
+            current_words=current_words,
+            target_words=target_words,
+            current_script=current_script,
+        )
+        system = "Você é um roteirista expandindo um roteiro curto. Retorne JSON válido."
+        return self._run_groq(system, user)
+
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=6), reraise=True)
+    def _run_groq(self, system: str, user: str) -> Script:
         completion = self.client.chat.completions.create(
             model=config.groq_model,
             messages=[
@@ -150,35 +258,15 @@ class ScriptWriter:
                 {"role": "user", "content": user},
             ],
             temperature=0.85,
-            max_tokens=3000,
+            max_tokens=3500,
             response_format={"type": "json_object"},
         )
-
         raw = completion.choices[0].message.content or "{}"
-        logger.info(f"Resposta do Groq: {len(raw)} chars")
-
         data = self._parse_json(raw)
-        script = self._to_script(data)
-        word_count = len(script.full_text.split())
-        logger.info(
-            f"Roteiro: {len(script.lines)} cenas | {word_count} palavras | "
-            f"alvo {min_words}-{max_words}"
-        )
-
-        # Se ficou MUITO curto, força retry via tenacity
-        if word_count < min_words * 0.7:  # 30% abaixo do mínimo
-            logger.warning(
-                f"Roteiro muito curto ({word_count} < {min_words*0.7:.0f}). "
-                f"Forçando retry pra gerar mais conteúdo."
-            )
-            raise RuntimeError(f"Roteiro muito curto: {word_count} palavras (mínimo {min_words})")
-
-        return script
+        return self._to_script(data)
 
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
-        # Groq já responde JSON puro por causa do response_format
-        # Mas reforço a extração pra garantir
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -191,12 +279,10 @@ class ScriptWriter:
     def _to_script(data: dict[str, Any]) -> Script:
         lines = []
         for item in data.get("lines", []):
-            # Hardening: tolera respostas mal formadas da IA
             text = (item.get("text") or "").strip()
             if not text:
-                continue  # pula linhas sem texto
+                continue
 
-            # scene_type: se inválido/ausente, usa VIDEO_BROLL como fallback
             raw_scene = (item.get("scene_type") or "video_broll").strip().lower()
             try:
                 scene_type = SceneType(raw_scene)
