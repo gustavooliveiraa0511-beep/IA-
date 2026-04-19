@@ -2,6 +2,9 @@
 python-telegram-bot==21.6
 
 # === IA: roteiro ===
+# Gemini é primário (melhor PT-BR, segue instruções de tamanho melhor).
+# Groq é fallback se Gemini der rate limit ou falhar.
+google-generativeai==0.8.3
 groq==0.11.0
 
 # === IA: narração ===

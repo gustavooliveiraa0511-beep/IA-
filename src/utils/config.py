@@ -26,7 +26,11 @@ class Config:
     telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_allowed_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_ALLOWED_CHAT_ID", ""))
 
-    # Groq
+    # Gemini (primário — melhor PT-BR)
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    gemini_model: str = "gemini-2.0-flash"
+
+    # Groq (fallback)
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))
     groq_model: str = "llama-3.3-70b-versatile"
 
@@ -56,10 +60,16 @@ class Config:
     video_fps: int = 30
 
     def validate_for_pipeline(self) -> list[str]:
-        """Retorna lista de configs faltando pra rodar o pipeline."""
+        """
+        Retorna lista de configs faltando pra rodar o pipeline.
+        Gemini OU Groq são aceitos (um fallback do outro).
+        """
         missing = []
+        # Pelo menos uma IA (Gemini ou Groq) tem que estar configurada
+        if not self.gemini_api_key and not self.groq_api_key:
+            missing.append("GEMINI_API_KEY ou GROQ_API_KEY")
+
         required = {
-            "GROQ_API_KEY": self.groq_api_key,
             "PEXELS_API_KEY": self.pexels_api_key,
             "PIXABAY_API_KEY": self.pixabay_api_key,
         }

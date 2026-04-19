@@ -1,17 +1,25 @@
 """
-Gera roteiro estruturado usando Groq (Llama 3.3 70B).
+Gera roteiro estruturado usando IA — cascata Gemini → Groq.
 
-Estratégia robusta em 3 camadas pra garantir roteiro com tamanho certo:
-1. Prompt super explícito com EXEMPLO concreto
-2. Se vier curto, faz 2ª chamada pra EXPANDIR
-3. Se mesmo assim tiver curto, usa o que tem (não trava o pipeline)
+Estratégia:
+1. Gemini 2.0 Flash (Google) — primário, melhor PT-BR e mais disciplinado
+2. Groq Llama 3.3 70B — fallback se Gemini falhar/rate limit
+
+Ambos têm:
+- Free tier generoso
+- Suporte a structured output (JSON)
+- Boa qualidade em português brasileiro
+
+Se o roteiro vier curto demais, a gente faz 2ª chamada pra expandir.
+Nunca falha o pipeline por tamanho — só loga warning.
 """
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Optional
 
+import google.generativeai as genai
 from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -58,7 +66,7 @@ Estilo GAMING / ENTRETENIMENTO:
 }
 
 
-SYSTEM_PROMPT = """Você é um roteirista especialista em vídeos motivacionais virais de {duration} segundos para TikTok/Reels.
+SYSTEM_PROMPT = """Você é um roteirista especialista em vídeos verticais virais de {duration} segundos para TikTok/Reels em português brasileiro.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 META PRINCIPAL: O ROTEIRO DEVE TER {target_words} PALAVRAS.
@@ -148,14 +156,31 @@ Cada cena deve ter 8-18 palavras COMPLETAS. Não corte palavras, ESCREVA MAIS.
 
 class ScriptWriter:
     def __init__(self) -> None:
-        if not config.groq_api_key:
-            raise ValueError("GROQ_API_KEY não configurado")
-        self.client = Groq(api_key=config.groq_api_key)
+        # Inicializa clientes disponíveis
+        self.gemini_available = bool(config.gemini_api_key)
+        self.groq_available = bool(config.groq_api_key)
+
+        if self.gemini_available:
+            genai.configure(api_key=config.gemini_api_key)
+            self.gemini_client = genai.GenerativeModel(config.gemini_model)
+
+        if self.groq_available:
+            self.groq_client = Groq(api_key=config.groq_api_key)
+
+        if not self.gemini_available and not self.groq_available:
+            raise ValueError(
+                "Nenhuma IA configurada. Configure GEMINI_API_KEY ou GROQ_API_KEY."
+            )
+
+        logger.info(
+            f"ScriptWriter: Gemini={'✅' if self.gemini_available else '❌'} | "
+            f"Groq={'✅' if self.groq_available else '❌'}"
+        )
 
     def generate(self, request: VideoRequest) -> Script:
         """
-        Gera roteiro com expansão automática se vier curto.
-        Nunca falha o pipeline por causa de tamanho — apenas warn.
+        Gera roteiro com cascata Gemini → Groq, expansão se curto,
+        e nunca trava o pipeline.
         """
         logger.info(f"Gerando roteiro: tema={request.theme!r} template={request.template}")
 
@@ -166,54 +191,6 @@ class ScriptWriter:
         min_scenes = max(5, duration // 6)
         max_scenes = max(8, duration // 3)
 
-        # === TENTATIVA 1: geração normal ===
-        script = self._call_groq(
-            request=request,
-            duration=duration,
-            target_words=target_words,
-            min_words=min_words,
-            max_words=max_words,
-            min_scenes=min_scenes,
-            max_scenes=max_scenes,
-        )
-        word_count = len(script.full_text.split())
-        logger.info(f"Tentativa 1: {len(script.lines)} cenas, {word_count} palavras (meta {target_words})")
-
-        # === TENTATIVA 2: expansão se curto ===
-        if word_count < min_words:
-            logger.warning(
-                f"Roteiro curto ({word_count} < {min_words}). "
-                f"Pedindo pra IA EXPANDIR..."
-            )
-            try:
-                expanded = self._expand_script(script, target_words)
-                expanded_words = len(expanded.full_text.split())
-                logger.info(f"Após expansão: {expanded_words} palavras")
-                if expanded_words > word_count:
-                    script = expanded
-                    word_count = expanded_words
-            except Exception as e:
-                logger.warning(f"Expansão falhou: {e}. Usando o roteiro original.")
-
-        # === FALLBACK FINAL: se ainda curto, usa mesmo assim (não crasha) ===
-        if word_count < min_words * 0.5:  # só alerta se < 50% do mínimo
-            logger.warning(
-                f"⚠️ Roteiro final tem {word_count} palavras (alvo {target_words}). "
-                f"Vídeo vai ficar mais curto que o ideal mas será gerado."
-            )
-
-        return script
-
-    def _call_groq(
-        self,
-        request: VideoRequest,
-        duration: int,
-        target_words: int,
-        min_words: int,
-        max_words: int,
-        min_scenes: int,
-        max_scenes: int,
-    ) -> Script:
         system = SYSTEM_PROMPT.format(
             duration=duration,
             target_words=target_words,
@@ -223,10 +200,9 @@ class ScriptWriter:
             max_scenes=max_scenes,
             template_instructions=TEMPLATE_INSTRUCTIONS[request.template],
         )
-
         user = (
             f"TEMA: {request.theme}\n\n"
-            f"Escreva um roteiro motivacional com {target_words} palavras "
+            f"Escreva um roteiro de {target_words} palavras "
             f"(distribuídas em {min_scenes}-{max_scenes} cenas de 8-18 palavras cada). "
             f"Siga o exemplo do sistema.\n\n"
             f"Conte as palavras antes de responder."
@@ -234,24 +210,103 @@ class ScriptWriter:
         if request.custom_script:
             user += f"\n\nTexto base do usuário (adapte em cenas):\n{request.custom_script}"
 
-        return self._run_groq(system, user)
-
-    def _expand_script(self, script: Script, target_words: int) -> Script:
-        """Segunda chamada: expande um roteiro curto."""
-        current_script = "\n".join(f"- {line.text}" for line in script.lines)
-        current_words = len(script.full_text.split())
-
-        user = EXPAND_PROMPT.format(
-            current_words=current_words,
-            target_words=target_words,
-            current_script=current_script,
+        # === TENTATIVA 1: geração (Gemini primário, Groq fallback) ===
+        script = self._generate_with_fallback(system, user)
+        word_count = len(script.full_text.split())
+        logger.info(
+            f"Tentativa 1: {len(script.lines)} cenas, {word_count} palavras "
+            f"(meta {target_words})"
         )
-        system = "Você é um roteirista expandindo um roteiro curto. Retorne JSON válido."
-        return self._run_groq(system, user)
 
+        # === TENTATIVA 2: expansão se curto ===
+        if word_count < min_words:
+            logger.warning(
+                f"Roteiro curto ({word_count} < {min_words}). "
+                f"Pedindo pra IA EXPANDIR..."
+            )
+            try:
+                current_script = "\n".join(f"- {line.text}" for line in script.lines)
+                expand_user = EXPAND_PROMPT.format(
+                    current_words=word_count,
+                    target_words=target_words,
+                    current_script=current_script,
+                )
+                expand_system = (
+                    "Você é um roteirista expandindo um roteiro curto. "
+                    "Retorne JSON válido."
+                )
+                expanded = self._generate_with_fallback(expand_system, expand_user)
+                expanded_words = len(expanded.full_text.split())
+                logger.info(f"Após expansão: {expanded_words} palavras")
+                if expanded_words > word_count:
+                    script = expanded
+                    word_count = expanded_words
+            except Exception as e:
+                logger.warning(f"Expansão falhou: {e}. Usando o roteiro original.")
+
+        # === FALLBACK FINAL: não crasha, só alerta ===
+        if word_count < min_words * 0.5:
+            logger.warning(
+                f"⚠️ Roteiro final com {word_count} palavras (alvo {target_words}). "
+                f"Vídeo vai ficar mais curto que o ideal mas será gerado."
+            )
+
+        return script
+
+    # ============================================
+    # Cascata Gemini → Groq
+    # ============================================
+    def _generate_with_fallback(self, system: str, user: str) -> Script:
+        """
+        Tenta Gemini primeiro. Se falhar, cai pro Groq.
+        """
+        # Nível 1: Gemini
+        if self.gemini_available:
+            try:
+                return self._call_gemini(system, user)
+            except Exception as e:
+                logger.warning(f"⚠️ Gemini falhou: {type(e).__name__}: {e}")
+                if self.groq_available:
+                    logger.warning("Tentando Groq como fallback...")
+                else:
+                    raise
+
+        # Nível 2: Groq
+        if self.groq_available:
+            return self._call_groq(system, user)
+
+        raise RuntimeError("Nenhuma IA disponível pra gerar roteiro")
+
+    # ============================================
+    # Gemini (primário)
+    # ============================================
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=6), reraise=True)
-    def _run_groq(self, system: str, user: str) -> Script:
-        completion = self.client.chat.completions.create(
+    def _call_gemini(self, system: str, user: str) -> Script:
+        logger.info("Chamando Gemini...")
+        # Gemini aceita system_instruction + single user message
+        model = genai.GenerativeModel(
+            model_name=config.gemini_model,
+            system_instruction=system,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.85,
+                max_output_tokens=4000,
+                response_mime_type="application/json",
+            ),
+        )
+        response = model.generate_content(user)
+        raw = response.text or "{}"
+        logger.info(f"Gemini respondeu: {len(raw)} chars")
+
+        data = self._parse_json(raw)
+        return self._to_script(data)
+
+    # ============================================
+    # Groq (fallback)
+    # ============================================
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=6), reraise=True)
+    def _call_groq(self, system: str, user: str) -> Script:
+        logger.info("Chamando Groq...")
+        completion = self.groq_client.chat.completions.create(
             model=config.groq_model,
             messages=[
                 {"role": "system", "content": system},
@@ -262,9 +317,14 @@ class ScriptWriter:
             response_format={"type": "json_object"},
         )
         raw = completion.choices[0].message.content or "{}"
+        logger.info(f"Groq respondeu: {len(raw)} chars")
+
         data = self._parse_json(raw)
         return self._to_script(data)
 
+    # ============================================
+    # Parsing compartilhado
+    # ============================================
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
         try:
@@ -307,7 +367,7 @@ class ScriptWriter:
 
         if not lines:
             raise RuntimeError(
-                "Groq retornou roteiro vazio/inválido. "
+                "IA retornou roteiro vazio/inválido. "
                 "Tente outro tema ou roda de novo."
             )
 
