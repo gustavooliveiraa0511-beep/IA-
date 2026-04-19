@@ -48,7 +48,7 @@ class Config:
     # Padrões
     default_template: str = field(default_factory=lambda: os.getenv("DEFAULT_TEMPLATE", "motivacional"))
     default_voice: str = field(default_factory=lambda: os.getenv("DEFAULT_VOICE", "pt-BR-AntonioNeural"))
-    video_duration_seconds: int = field(default_factory=lambda: int(os.getenv("VIDEO_DURATION_SECONDS", "30")))
+    video_duration_seconds: int = field(default_factory=lambda: int(os.getenv("VIDEO_DURATION_SECONDS", "45")))
 
     # Dimensões do vídeo (vertical 9:16 Full HD)
     video_width: int = 1080

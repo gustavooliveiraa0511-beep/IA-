@@ -59,12 +59,18 @@ Estilo GAMING / ENTRETENIMENTO:
 
 SYSTEM_PROMPT = """Você é um roteirista especialista em vídeos curtos verticais (TikTok/Reels/Shorts) com alta retenção.
 
-REGRAS OBRIGATÓRIAS:
-1. O roteiro deve caber em {duration} segundos narrado em português do Brasil (ritmo ~160 palavras/minuto)
-2. Cada cena tem UMA frase curta (máximo 15 palavras por cena)
-3. Total de 6-10 cenas pra dar dinamismo
-4. Primeira cena SEMPRE é hook de impacto nos 3 primeiros segundos
-5. Use linguagem simples, direta, com emoção
+⚠️ REGRAS OBRIGATÓRIAS DE TAMANHO ⚠️
+
+1. DURAÇÃO ALVO: {duration} segundos narrados (NÃO menos!)
+2. TAMANHO TOTAL: o roteiro COMPLETO (somando todas as cenas) deve ter entre {min_words} e {max_words} palavras em português. NUNCA menos que {min_words}.
+3. NÚMERO DE CENAS: pelo menos {min_scenes} cenas, ideal {ideal_scenes}.
+4. POR CENA: cada cena tem 1-2 frases com 8 a 18 palavras cada (NUNCA menos de 8 palavras por cena).
+5. HOOK: a primeira cena é impacto forte nos primeiros 3 segundos — pergunta, fato surpreendente, ou afirmação forte.
+6. Use português BRASILEIRO natural, direto, emocional.
+7. Termine com call-to-action curto ("siga pra mais", "salva esse vídeo", etc.)
+
+⛔ NÃO escreva roteiro curto. Se escrever menos de {min_words} palavras, está ERRADO.
+⛔ NÃO use frases soltas de 3-4 palavras. Cada cena precisa de substância.
 
 {template_instructions}
 
@@ -110,11 +116,30 @@ class ScriptWriter:
     def generate(self, request: VideoRequest) -> Script:
         logger.info(f"Gerando roteiro: tema={request.theme!r} template={request.template}")
 
+        # Calcula metas de tamanho baseadas na duração
+        # ~150 palavras por minuto em PT-BR narrado
+        duration = request.duration_seconds
+        target_words = int(duration * 150 / 60)   # ex: 30s → 75 palavras
+        min_words = int(target_words * 0.85)       # -15% tolerância
+        max_words = int(target_words * 1.20)       # +20% tolerância
+        min_scenes = max(5, duration // 6)         # pelo menos 1 cena a cada 6s
+        ideal_scenes = max(6, duration // 4)       # ideal: 1 cena a cada 4s
+
         system = SYSTEM_PROMPT.format(
-            duration=request.duration_seconds,
+            duration=duration,
+            min_words=min_words,
+            max_words=max_words,
+            min_scenes=min_scenes,
+            ideal_scenes=ideal_scenes,
             template_instructions=TEMPLATE_INSTRUCTIONS[request.template],
         )
-        user = f"Tema do vídeo: {request.theme}"
+
+        user = (
+            f"Tema do vídeo: {request.theme}\n\n"
+            f"REGRA REFORÇADA: escreva entre {min_words} e {max_words} palavras "
+            f"no total do roteiro. Isso equivale a aproximadamente {duration} segundos "
+            f"quando narrado. Verifique o tamanho antes de responder."
+        )
         if request.custom_script:
             user += f"\n\nTexto base do usuário (adapte em cenas):\n{request.custom_script}"
 
@@ -124,8 +149,8 @@ class ScriptWriter:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=0.9,
-            max_tokens=2048,
+            temperature=0.85,
+            max_tokens=3000,
             response_format={"type": "json_object"},
         )
 
@@ -134,7 +159,20 @@ class ScriptWriter:
 
         data = self._parse_json(raw)
         script = self._to_script(data)
-        logger.info(f"Roteiro: {len(script.lines)} cenas | {len(script.full_text)} chars")
+        word_count = len(script.full_text.split())
+        logger.info(
+            f"Roteiro: {len(script.lines)} cenas | {word_count} palavras | "
+            f"alvo {min_words}-{max_words}"
+        )
+
+        # Se ficou MUITO curto, força retry via tenacity
+        if word_count < min_words * 0.7:  # 30% abaixo do mínimo
+            logger.warning(
+                f"Roteiro muito curto ({word_count} < {min_words*0.7:.0f}). "
+                f"Forçando retry pra gerar mais conteúdo."
+            )
+            raise RuntimeError(f"Roteiro muito curto: {word_count} palavras (mínimo {min_words})")
+
         return script
 
     @staticmethod

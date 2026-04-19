@@ -30,7 +30,7 @@ class VideoRequest(BaseModel):
     """Pedido do usuário (vem do Telegram)."""
     theme: str
     template: TemplateType = TemplateType.MOTIVACIONAL
-    duration_seconds: int = 30
+    duration_seconds: int = 45  # balanceamento: tempo suficiente sem saturar
     voice: str = "pt-BR-AntonioNeural"
     custom_script: Optional[str] = None  # se o usuário quiser mandar o próprio texto
 
