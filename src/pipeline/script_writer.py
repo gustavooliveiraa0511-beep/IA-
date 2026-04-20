@@ -348,8 +348,12 @@ class ScriptWriter:
         return script
 
     # ============================================
-    # PASS A: OUTLINE
+    # PASS A: OUTLINE (com retry + fallback mecânico)
     # ============================================
+    # Chaves alternativas que LLMs às vezes usam no lugar de "beats".
+    # Aceitamos todas pra não falhar por divergência de formato.
+    _OUTLINE_ALT_KEYS = ("beats", "outline", "items", "scenes", "cenas", "bullets")
+
     def _generate_outline(
         self,
         theme: str,
@@ -358,6 +362,11 @@ class ScriptWriter:
         min_scenes: int,
         max_scenes: int,
     ) -> dict[str, Any]:
+        """
+        Gera outline via LLM com 2 tentativas. Se ambas falharem (parse quebra,
+        rate limit, resposta sem beats), retorna um outline mecânico default
+        baseado no tema — garante que o pipeline NUNCA morre aqui.
+        """
         prompt = OUTLINE_PROMPT.format(
             theme=theme,
             duration=duration,
@@ -365,15 +374,86 @@ class ScriptWriter:
             min_scenes=min_scenes,
             max_scenes=max_scenes,
         )
-        raw = self._call_with_fallback(
-            system="Você é um editor-chefe de conteúdo viral. Responda só JSON válido.",
-            user=prompt,
-            max_tokens=1200,
+        last_error: str = ""
+        for attempt in range(2):
+            try:
+                raw = self._call_with_fallback(
+                    system="Você é um editor-chefe de conteúdo viral. Responda só JSON válido.",
+                    user=prompt,
+                    max_tokens=1200,
+                )
+                data = self._parse_json(raw)
+
+                # Normaliza: aceita chaves alternativas ("outline", "scenes", etc).
+                if not data.get("beats"):
+                    for alt_key in self._OUTLINE_ALT_KEYS:
+                        if data.get(alt_key):
+                            data["beats"] = data[alt_key]
+                            logger.info(
+                                f"[ScriptWriter] Outline usou chave alternativa "
+                                f"{alt_key!r} → normalizada pra 'beats'"
+                            )
+                            break
+
+                beats = data.get("beats") or []
+                if beats and isinstance(beats, list):
+                    return data
+
+                last_error = (
+                    f"IA retornou JSON sem 'beats' (chaves recebidas: "
+                    f"{list(data.keys())[:5]})"
+                )
+                logger.warning(
+                    f"[ScriptWriter] Outline tentativa {attempt + 1}: {last_error}"
+                )
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"[ScriptWriter] Outline tentativa {attempt + 1} falhou: {last_error}"
+                )
+
+        # Todas as tentativas falharam — usa outline mecânico default baseado
+        # só no tema. Cenas serão genéricas mas o pipeline inteiro roda.
+        logger.warning(
+            f"[ScriptWriter] Outline LLM falhou 2x ({last_error}). "
+            f"Usando outline mecânico default."
         )
-        data = self._parse_json(raw)
-        if not data.get("beats"):
-            raise RuntimeError("Outline vazio — IA não retornou beats")
-        return data
+        return self._default_outline(theme, min_scenes, max_scenes)
+
+    @staticmethod
+    def _default_outline(theme: str, min_scenes: int, max_scenes: int) -> dict[str, Any]:
+        """
+        Gera um outline default sem IA — estrutura hook/dev/dev/climax/cta
+        com frases genéricas baseadas no tema. Último recurso pra garantir
+        que o pipeline sempre tenha algo pra expandir.
+
+        NOTA: esse outline depois vai pro _expand_outline (que chama a IA de
+        novo pra expandir). Se até a IA de expansão falhar, o orchestrator cai
+        pro _mechanical_from_outline que transforma esses beats em ScriptLines
+        diretamente (sem LLM). Então qualquer caminho gera vídeo.
+        """
+        theme_clean = theme.strip().rstrip(".!?")
+        # Número de beats proporcional à duração (clamped ao request)
+        n_dev = max(2, min(4, (min_scenes + max_scenes) // 2 - 2))
+        beats: list[dict[str, str]] = [
+            {"role": "hook", "idea": f"Você sabia isso sobre {theme_clean}?"},
+        ]
+        dev_templates = [
+            f"O que ninguém conta sobre {theme_clean}.",
+            f"Os detalhes que mudam tudo em {theme_clean}.",
+            f"A história real por trás de {theme_clean}.",
+            f"O que aconteceu de verdade com {theme_clean}.",
+        ]
+        for i in range(n_dev):
+            beats.append({"role": "development", "idea": dev_templates[i % len(dev_templates)]})
+        beats.append({"role": "climax", "idea": f"E é aqui que {theme_clean} mudou tudo."})
+        beats.append({"role": "cta", "idea": "Salve pra lembrar disso."})
+
+        return {
+            "title": theme_clean[:60],
+            "hashtags": [f"#{theme_clean.split()[0].lower()}" if theme_clean else "#viral"],
+            "beats": beats,
+        }
 
     # ============================================
     # PASS B: EXPAND
