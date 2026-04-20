@@ -299,11 +299,26 @@ class ScriptWriter:
             max_words=max_words,
         )
 
+        script = None
         if premium:
             logger.info("[ScriptWriter] Modo PREMIUM: 3 rascunhos paralelos + seleção")
-            script = self._premium_expand(expand_fn)
-        else:
-            script = None
+            try:
+                script = self._premium_expand(expand_fn)
+            except Exception as e:
+                logger.warning(
+                    f"[ScriptWriter] Modo premium falhou ({type(e).__name__}): {e}. "
+                    f"Caindo pro modo standard (1 tentativa) antes do mecânico."
+                )
+                # Tenta 1x em modo standard antes de desistir pro mecânico
+                try:
+                    script = expand_fn()
+                except Exception as e2:
+                    logger.warning(
+                        f"[ScriptWriter] Fallback standard também falhou: "
+                        f"{type(e2).__name__}: {e2}"
+                    )
+
+        if script is None and not premium:
             # Tenta 2 vezes antes de cair pro outline mecânico. A segunda
             # tentativa costuma ser mais curta/certeira porque o LLM varia
             # resposta entre calls.
@@ -316,12 +331,15 @@ class ScriptWriter:
                         f"[ScriptWriter] Expand tentativa {attempt + 1} falhou "
                         f"({type(e).__name__}): {e}"
                     )
-            if script is None:
-                logger.warning(
-                    "[ScriptWriter] Todas as tentativas de expand falharam, "
-                    "caindo pro outline mecânico (roteiro básico, mas funcional)"
-                )
-                script = self._mechanical_from_outline(outline, request.template)
+
+        # Fallback final compartilhado: se nem standard nem premium deram certo,
+        # usa outline mecânico (sempre funciona — não depende do LLM).
+        if script is None:
+            logger.warning(
+                "[ScriptWriter] Todas as tentativas de expand falharam, "
+                "caindo pro outline mecânico (roteiro básico, mas funcional)"
+            )
+            script = self._mechanical_from_outline(outline, request.template)
 
         word_count = len(script.full_text.split())
         logger.info(
@@ -386,7 +404,9 @@ class ScriptWriter:
                 "Cada cena referencia a anterior com conector explícito. Responda só JSON."
             ),
             user=prompt,
-            max_tokens=8000,  # few-shot + visual_queries gera JSON longo; 8K é o teto do 2.5 flash
+            max_tokens=12000,  # few-shot + visual_queries + impact_level → JSON longo.
+            # Gemini 2.5 Flash suporta até 65K tokens de output; 12K dá folga
+            # pra roteiros com 10-15 cenas sem truncar.
         )
         data = self._parse_json(raw)
         script = self._to_script(data, outline)
@@ -676,99 +696,38 @@ def _recover_truncated_json(raw: str) -> dict[str, Any] | None:
     de uma string/array/objeto, esta função tenta fechar as estruturas
     pendentes e parsear o que deu.
 
-    Estratégia simples: fatia o texto em pontos "seguros" onde sabemos que
-    um objeto terminou (`},`) e tenta fechar cada nível em aberto.
+    Estratégias (tenta na ordem):
+    1. Truncar no último objeto interno completo (`},`) antes do truncate —
+       pega a maior parte das cenas quando o LLM truncou dentro de uma cena.
+    2. Truncar em último ponto "seguro" (fora de string, depth consistente) e
+       fechar todos os brackets/braces pendentes.
+    3. Último recurso: fatiar bem no início (primeiro `{...}` topo) e fechar
+       tudo — retorna dict mesmo que sem `lines`, permitindo fallback upstream.
     """
-    # Pega só do primeiro { em diante
     idx = raw.find("{")
     if idx < 0:
         return None
     text = raw[idx:]
 
-    # Tenta várias estratégias, do mais agressivo ao mais conservador
     candidates: list[str] = []
 
-    # Estratégia A: fatia no último `}` completo visto
-    last_obj_close = text.rfind("}")
-    if last_obj_close > 0:
-        candidates.append(text[: last_obj_close + 1])
+    # === Estratégia 1: último objeto interno completo + fechar wrappers ===
+    # Ex: `{"lines":[{...},{...},{...<TRUNC>` → cortar no último `},` e fechar.
+    last_good_obj = _find_last_complete_inner_object(text)
+    if last_good_obj > 0:
+        partial = text[:last_good_obj]
+        # Fecha estruturas pendentes (arrays/objetos abertos)
+        closed = _close_open_structures(partial)
+        if closed:
+            candidates.append(closed)
 
-    # Estratégia B: vai removendo de trás pra frente até achar um ponto
-    # seguro e tenta fechar brackets/braces pendentes
-    for strategy_n in range(1, 5):
-        work = text
-        # Remove última string possivelmente incompleta: corta no último `"` que fecha par
-        # Forma bruta mas suficiente
-        # Remove qualquer vírgula pendente no fim
-        work = work.rstrip()
-        if work.endswith(","):
-            work = work[:-1]
-        # Remove qualquer key: "value incompleto (aspas abertas no fim)
-        # Conta aspas dentro pra descobrir se estamos dentro de string
-        in_str = False
-        escape = False
-        depth_brace = 0
-        depth_bracket = 0
-        last_safe = -1
-        for i, ch in enumerate(work):
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if ch == "{":
-                depth_brace += 1
-            elif ch == "}":
-                depth_brace -= 1
-                if depth_brace >= 0 and depth_bracket >= 0:
-                    last_safe = i + 1
-            elif ch == "[":
-                depth_bracket += 1
-            elif ch == "]":
-                depth_bracket -= 1
-        # Trunca até a última posição "fora de string"
-        if in_str and last_safe > 0:
-            work = work[:last_safe]
-        # Remove vírgula pendente
-        work = work.rstrip().rstrip(",")
-        # Fecha arrays e objetos pendentes
-        # Recalcula depth atual
-        in_str = False
-        escape = False
-        db = 0
-        dbr = 0
-        for ch in work:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if ch == "{":
-                db += 1
-            elif ch == "}":
-                db -= 1
-            elif ch == "[":
-                dbr += 1
-            elif ch == "]":
-                dbr -= 1
-        # Fecha brackets primeiro (arrays), depois braces (objetos)
-        closing = ("]" * max(0, dbr)) + ("}" * max(0, db))
-        candidates.append(work + closing)
-        break  # uma estratégia basta
+    # === Estratégia 2: trunca no último ponto fora de string e fecha ===
+    closed_2 = _close_open_structures(text)
+    if closed_2:
+        candidates.append(closed_2)
 
-    # Tenta parsear cada candidato
+    # Tenta cada candidato. Aceita SÓ se o resultado tiver algum dado útil
+    # (title ou lines ou beats — pelo menos indica que parseou um dict viável).
     for c in candidates:
         try:
             data = json.loads(c)
@@ -777,3 +736,139 @@ def _recover_truncated_json(raw: str) -> dict[str, Any] | None:
         except (json.JSONDecodeError, ValueError):
             continue
     return None
+
+
+def _find_last_complete_inner_object(text: str) -> int:
+    """
+    Retorna o índice (exclusive) logo após o último `}` que pertence a um
+    objeto interno COMPLETO (no mesmo nível de aninhamento do primeiro objeto
+    interno). Retorna -1 se não houver nenhum.
+
+    Exemplo:
+      text = `{"lines":[{"text":"a"},{"text":"b"},{"text":"trun`
+      Retorna a posição logo depois de `{"text":"b"}` — o JSON pode ser
+      fechado com `]}` e conter 2 cenas completas.
+    """
+    in_str = False
+    escape = False
+    depth = 0       # profundidade de `{}`
+    target_depth = 2  # objeto interno do array de "lines" vive em depth 2+
+    last_good = -1
+
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            # Se acabou de fechar um objeto interno profundo, marca.
+            if depth == target_depth:
+                last_good = i + 1
+            depth -= 1
+    return last_good
+
+
+def _close_open_structures(text: str) -> str | None:
+    """
+    Trunca `text` no último ponto fora de string/com depth válido e fecha
+    brackets/braces/aspas pendentes pra formar JSON válido.
+
+    Retorna a string fechada ou None se não conseguir reconstruir algo útil.
+    """
+    # 1. Scan: descobre o último índice "seguro" — onde estamos FORA de string
+    # e com depth consistente (depth_brace e depth_bracket >= 0).
+    in_str = False
+    escape = False
+    depth_brace = 0
+    depth_bracket = 0
+    last_safe = 0
+
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            # fronteira "saindo" da string é um ponto seguro
+            if not in_str:
+                last_safe = i + 1
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket -= 1
+        # Ponto seguro: fora de string, após processar o char
+        if depth_brace >= 0 and depth_bracket >= 0:
+            last_safe = i + 1
+
+    # 2. Se o texto terminou dentro de string, trunca no último ponto seguro
+    work = text[:last_safe] if in_str else text
+
+    # 3. Limpa separadores pendentes (vírgula, dois-pontos, chaves de key
+    # sem valor) que podem ter ficado no fim após truncar.
+    work = work.rstrip()
+    while work and work[-1] in ",:":
+        work = work[:-1].rstrip()
+    # Se terminou em `"key"` sem valor, remove a key incompleta — busca a
+    # última vírgula ou chave aberta antes dela e corta.
+    if work.endswith('"'):
+        # Provavelmente dangling key — retrocede até `,` ou `{` prévio.
+        for back in range(len(work) - 2, -1, -1):
+            if work[back] in ",{[":
+                work = work[: back + 1].rstrip()
+                if work.endswith(","):
+                    work = work[:-1].rstrip()
+                break
+
+    # 4. Recalcula depths finais
+    in_str = False
+    escape = False
+    db = 0
+    dbr = 0
+    for ch in work:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            db += 1
+        elif ch == "}":
+            db -= 1
+        elif ch == "[":
+            dbr += 1
+        elif ch == "]":
+            dbr -= 1
+
+    # Se ainda está dentro de string (aspa nunca fechou), fecha a aspa
+    if in_str:
+        work += '"'
+
+    # Fecha em ordem: arrays primeiro, objetos depois (LIFO inverso da abertura)
+    closing = ("]" * max(0, dbr)) + ("}" * max(0, db))
+    result = work + closing
+    return result if result else None
